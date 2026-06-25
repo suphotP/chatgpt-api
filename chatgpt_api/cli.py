@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
 import mimetypes
 import os
@@ -26,11 +27,19 @@ from chatgpt_api.providers.chatgpt.account_info import (
     load_settings_file,
 )
 from chatgpt_api.providers.chatgpt.accounts import (
+    accounts_dir_from_env,
     list_account_profiles,
     resolve_account_capture_path,
     resolve_account_settings_path,
 )
 from chatgpt_api.providers.chatgpt.auth import ChatGPTAuthConfig
+from chatgpt_api.providers.chatgpt.crypto import (
+    clear_runtime_passphrase,
+    key_file_path,
+    load_secrets_key,
+    reencrypt_file,
+    set_runtime_passphrase,
+)
 from chatgpt_api.providers.chatgpt.models import parse_model_picker
 from chatgpt_api.providers.chatgpt.proof import decode_proof_config, generate_proof_token
 from chatgpt_api.providers.chatgpt.provider import ChatGPTProvider
@@ -122,6 +131,25 @@ def build_parser() -> argparse.ArgumentParser:
     account_limits.add_argument("--impersonate", default="safari18_4")
     account_limits.add_argument("--json", action="store_true")
     account_limits.set_defaults(func=cmd_account_limits)
+
+    secrets = subparsers.add_parser("secrets", help="Manage local account-secrets encryption")
+    secrets_subparsers = secrets.add_subparsers(required=True)
+    secrets_rotate = secrets_subparsers.add_parser(
+        "rotate",
+        help="Re-encrypt stored account captures under new key material, for example when switching to a passphrase",
+    )
+    secrets_rotate.add_argument("--accounts-dir", type=Path, default=_accounts_dir_default())
+    secrets_rotate.add_argument(
+        "--from-passphrase-prompt",
+        action="store_true",
+        help="Prompt for the current passphrase used to decrypt existing captures",
+    )
+    secrets_rotate.add_argument(
+        "--to-passphrase-prompt",
+        action="store_true",
+        help="Prompt for the new passphrase; omit to rotate to a fresh auto-generated key file instead",
+    )
+    secrets_rotate.set_defaults(func=cmd_secrets_rotate)
 
     admin = subparsers.add_parser("admin", help="Manage a running Bridge API from CLI or Docker")
     admin.add_argument("--base-url", default=os.environ.get("CHATGPT_ADMIN_BASE_URL") or os.environ.get("CHATGPT_BASE_URL") or "http://127.0.0.1:8000/v1")
@@ -420,6 +448,16 @@ def _add_serve_arguments(parser: argparse.ArgumentParser) -> None:
         help="Account routing strategy: auto, sticky, failover, round-robin, weighted, quota-aware",
     )
     parser.add_argument("--accounts-dir", type=Path, default=_accounts_dir_default())
+    parser.add_argument(
+        "--secrets-passphrase-prompt",
+        action="store_true",
+        help=(
+            "Prompt for the account-secrets passphrase at startup instead of using an "
+            "auto-generated key file. The passphrase is held in memory only for this "
+            "process, so a cold copy of this machine's disk (lost laptop, leaked backup) "
+            "carries no usable key. Requires a TTY; not compatible with detached Docker."
+        ),
+    )
     parser.add_argument("--host", default=os.environ.get("CHATGPT_API_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("CHATGPT_API_PORT", "8000")))
     parser.add_argument("--api-key", default=os.environ.get("CHATGPT_API_KEY"))
@@ -1018,6 +1056,56 @@ async def cmd_accounts(args: argparse.Namespace) -> int:
             f"{profile.name}: capture={'yes' if profile.exists else 'no'} "
             f"settings={'yes' if profile.has_settings else 'no'} path={profile.capture_path}"
         )
+    return 0
+
+
+async def cmd_secrets_rotate(args: argparse.Namespace) -> int:
+    accounts_dir = args.accounts_dir or accounts_dir_from_env()
+
+    if args.from_passphrase_prompt:
+        set_runtime_passphrase(getpass.getpass("current passphrase: "))
+        old_key = load_secrets_key(accounts_dir)
+        clear_runtime_passphrase()
+    else:
+        old_key = load_secrets_key(accounts_dir)
+
+    profiles = list_account_profiles(accounts_dir)
+    if not profiles:
+        print("no account profiles found")
+        return 0
+
+    switching_to_passphrase = bool(args.to_passphrase_prompt)
+    if switching_to_passphrase:
+        new_passphrase = getpass.getpass("new passphrase: ")
+        if not new_passphrase:
+            raise ProviderError("new passphrase must not be empty")
+        if getpass.getpass("confirm new passphrase: ") != new_passphrase:
+            raise ProviderError("passphrases did not match")
+        set_runtime_passphrase(new_passphrase)
+        new_key = load_secrets_key(accounts_dir)
+        clear_runtime_passphrase()
+    else:
+        key_path = key_file_path(accounts_dir)
+        if key_path.exists():
+            key_path.unlink()
+        new_key = load_secrets_key(accounts_dir)
+
+    rotated = 0
+    for profile in profiles:
+        if reencrypt_file(profile.capture_path, old_key, new_key):
+            rotated += 1
+            print(f"{profile.name}: rotated")
+        elif profile.exists:
+            print(f"{profile.name}: skipped (capture is plaintext; update it once to encrypt)")
+        else:
+            print(f"{profile.name}: skipped (no capture file)")
+    print(f"rotated {rotated} of {len(profiles)} account capture(s)")
+
+    if switching_to_passphrase:
+        key_path = key_file_path(accounts_dir)
+        if key_path.exists():
+            key_path.unlink()
+            print(f"removed {key_path}: captures now require the passphrase, not a key file")
     return 0
 
 
@@ -2065,6 +2153,8 @@ async def cmd_probe_capture(args: argparse.Namespace) -> int:
 async def cmd_serve(args: argparse.Namespace) -> int:
     if getattr(args, "interactive", False):
         _apply_interactive_serve_args(args)
+    if getattr(args, "secrets_passphrase_prompt", False):
+        _prompt_secrets_passphrase()
     run_server(
         OpenAICompatConfig(
             account=args.account,
@@ -2148,6 +2238,17 @@ def _apply_interactive_serve_args(args: argparse.Namespace) -> None:
     args.image_output_dir = Path(_prompt_text("image output dir", default=str(args.image_output_dir)))
     args.research_output_dir = Path(_prompt_text("research output dir", default=str(args.research_output_dir)))
     args.admin_db_path = Path(_prompt_text("admin DB path", default=str(args.admin_db_path)))
+
+
+def _prompt_secrets_passphrase() -> None:
+    if not sys.stdin.isatty():
+        raise ProviderError("--secrets-passphrase-prompt requires a TTY")
+    passphrase = getpass.getpass("account secrets passphrase: ")
+    if not passphrase:
+        raise ProviderError("account secrets passphrase must not be empty")
+    if getpass.getpass("confirm passphrase: ") != passphrase:
+        raise ProviderError("passphrases did not match")
+    set_runtime_passphrase(passphrase)
 
 
 async def _probe_capture_httpx(

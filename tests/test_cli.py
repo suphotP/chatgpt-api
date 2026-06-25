@@ -1,6 +1,15 @@
 from pathlib import Path
 
+import chatgpt_api.cli as cli
 from chatgpt_api.cli import main
+from chatgpt_api.providers.chatgpt.crypto import (
+    clear_runtime_passphrase,
+    decrypt_text,
+    encrypt_text,
+    key_file_path,
+    load_secrets_key,
+    set_runtime_passphrase,
+)
 
 
 def test_inspect_capture_redacts_secret_headers(tmp_path, capsys):
@@ -123,6 +132,51 @@ Request Data: {"action":"next","model":"gpt-5-5-thinking","thinking_effort":"ext
     assert "observed_efforts=extended, max, instant, medium, high" in output
     assert "settings_available_reasoning_efforts=instant, medium, high" in output
     assert "pro@example.com" not in output
+
+
+def test_secrets_rotate_switches_key_file_to_passphrase(tmp_path, capsys, monkeypatch):
+    accounts_dir = tmp_path / "accounts"
+    account_dir = accounts_dir / "pro"
+    account_dir.mkdir(parents=True)
+    capture_path = account_dir / "chatgpt-request.txt"
+
+    old_key = load_secrets_key(accounts_dir)
+    capture_path.write_text(encrypt_text("URL: https://chatgpt.com\n", old_key), encoding="utf-8")
+    assert key_file_path(accounts_dir).exists()
+
+    responses = iter(["new-passphrase", "new-passphrase"])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(responses))
+
+    exit_code = main(["secrets", "rotate", "--accounts-dir", str(accounts_dir), "--to-passphrase-prompt"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "pro: rotated" in output
+    assert "rotated 1 of 1" in output
+    assert not key_file_path(accounts_dir).exists()
+
+    set_runtime_passphrase("new-passphrase")
+    new_key = load_secrets_key(accounts_dir)
+    clear_runtime_passphrase()
+    assert decrypt_text(capture_path.read_text(encoding="utf-8"), new_key) == "URL: https://chatgpt.com\n"
+
+
+def test_secrets_rotate_rejects_mismatched_new_passphrase(tmp_path, capsys, monkeypatch):
+    accounts_dir = tmp_path / "accounts"
+    account_dir = accounts_dir / "pro"
+    account_dir.mkdir(parents=True)
+    capture_path = account_dir / "chatgpt-request.txt"
+    old_key = load_secrets_key(accounts_dir)
+    capture_path.write_text(encrypt_text("URL: https://chatgpt.com\n", old_key), encoding="utf-8")
+
+    responses = iter(["one", "two"])
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": next(responses))
+
+    exit_code = main(["secrets", "rotate", "--accounts-dir", str(accounts_dir), "--to-passphrase-prompt"])
+
+    assert exit_code == 2
+    assert "did not match" in capsys.readouterr().err
+    assert key_file_path(accounts_dir).exists()
 
 
 def test_account_capabilities_from_account_profile(tmp_path, capsys):

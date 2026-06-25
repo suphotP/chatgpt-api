@@ -1151,6 +1151,21 @@ python3 -m chatgpt_api server start --interactive
 python3 -m chatgpt_api server start --accounts free-main,pro-main --api-key local-dev-key
 ```
 
+Start with a passphrase-derived key instead of the auto key file (prompts at
+launch, never written to disk):
+
+```sh
+python3 -m chatgpt_api server start --accounts free-main,pro-main --secrets-passphrase-prompt
+```
+
+Rotate account-capture encryption onto a passphrase (or back onto a fresh
+auto key file):
+
+```sh
+python3 -m chatgpt_api secrets rotate --accounts-dir secrets/accounts --to-passphrase-prompt
+python3 -m chatgpt_api secrets rotate --accounts-dir secrets/accounts
+```
+
 Direct provider chat:
 
 ```sh
@@ -1371,6 +1386,38 @@ MIT. See [LICENSE](LICENSE).
 - For LAN demos, use a strong `CHATGPT_API_KEY`.
 - Generated files under `outputs/` can contain private prompts, images, and
   research reports.
+- Account captures are encrypted at rest. The first save under a
+  `secrets/accounts/` tree auto-generates an owner-only (`0600`) master key
+  file (`secrets/accounts/.master.key`) and encrypts the capture with it; old
+  plaintext captures are still read transparently, so no manual migration is
+  required.
+- This default (auto key file) only protects against the capture file
+  leaking on its own (a backup, a cloud sync, a copy-paste mistake). It does
+  **not** protect against someone who copies the whole `secrets/` directory,
+  since the key sits right next to the data it unlocks, and it does not
+  protect against a live-compromised machine: while the bridge is running it
+  holds decrypted tokens in memory to make real requests, and any caller who
+  can reach the local API can already use those tokens. No local at-rest
+  scheme closes that second gap.
+- For real protection against a stolen laptop or leaked backup (the data
+  carries no usable key at all), start the server with
+  `--secrets-passphrase-prompt` instead of relying on the auto key file. You
+  will be prompted for a passphrase at launch; it is held in memory for that
+  process only and never written to disk or the environment. Use
+  `CHATGPT_SECRETS_PASSPHRASE` instead if you need a non-interactive
+  (Docker/headless) equivalent — convenient, but weaker, since the passphrase
+  can end up in shell history, `.env` files, or process listings.
+- Switching between key modes (auto key file <-> passphrase) requires
+  re-encrypting existing captures, since the old key can no longer be derived
+  automatically. Use:
+  ```sh
+  chatgpt-api secrets rotate --accounts-dir secrets/accounts --to-passphrase-prompt
+  ```
+  to move from the auto key file to a passphrase (this also deletes the old
+  key file once every capture is confirmed re-encrypted), or omit
+  `--to-passphrase-prompt` to rotate onto a fresh auto-generated key file.
+  Add `--from-passphrase-prompt` if the captures are currently encrypted with
+  a passphrase that is not in `CHATGPT_SECRETS_PASSPHRASE`.
 
 ## Troubleshooting
 

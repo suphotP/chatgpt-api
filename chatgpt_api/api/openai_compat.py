@@ -50,11 +50,13 @@ from chatgpt_api.core.errors import ProviderError
 from chatgpt_api.core.types import ChatRequest, ContentPart, ImageRequest, ImageResponse, Message
 from chatgpt_api.providers.chatgpt.account_info import detect_account_info, infer_account_capabilities, load_settings_file
 from chatgpt_api.providers.chatgpt.accounts import (
+    accounts_dir_from_env,
     list_account_profiles,
     resolve_account_capture_path,
     resolve_account_settings_path,
 )
 from chatgpt_api.providers.chatgpt.auth import ChatGPTAuthConfig
+from chatgpt_api.providers.chatgpt.crypto import encrypt_text, load_secrets_key
 from chatgpt_api.providers.chatgpt.provider import ChatGPTProvider
 from chatgpt_api.providers.chatgpt.request_capture import CapturedRequest, SECRET_HEADER_NAMES
 from chatgpt_api.providers.chatgpt.transport import ChatGPTWebTransport
@@ -2458,7 +2460,9 @@ def _save_account_capture_payload(config: OpenAICompatConfig, body: dict[str, An
         }
     capture_path = resolve_account_capture_path(account, config.accounts_dir)
     capture_path.parent.mkdir(parents=True, exist_ok=True)
-    capture_path.write_text(capture_text, encoding="utf-8")
+    accounts_dir = config.accounts_dir if config.accounts_dir is not None else accounts_dir_from_env()
+    key = load_secrets_key(accounts_dir)
+    capture_path.write_text(encrypt_text(capture_text, key), encoding="utf-8")
     if settings_text:
         settings_path = resolve_account_settings_path(account, config.accounts_dir)
         settings_path.parent.mkdir(parents=True, exist_ok=True)

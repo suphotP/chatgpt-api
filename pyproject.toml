@@ -9,6 +9,7 @@ description = "Provider-first AI chat and image framework with ChatGPT Web as th
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
+  "cryptography>=42",
   "curl_cffi>=0.11",
   "httpx>=0.27",
   "websocket-client>=1.8",

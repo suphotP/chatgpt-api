@@ -38,6 +38,7 @@ from chatgpt_api.api.openai_compat import (
 )
 from chatgpt_api.core.errors import ProviderError
 from chatgpt_api.core.types import ChatDelta, ImageAsset, ImageResponse
+from chatgpt_api.providers.chatgpt.crypto import decrypt_text, is_encrypted, load_secrets_key
 
 
 def test_resolve_model_alias_maps_intelligence_presets():
@@ -189,9 +190,10 @@ Request Data: {"action":"next","model":"auto"}
     assert payload["saved"] is True
     assert payload["inspection"]["ok"] is True
     assert payload["inspection"]["warnings"] == []
-    assert (tmp_path / "accounts" / "pro" / "chatgpt-request.txt").read_text(
-        encoding="utf-8",
-    ) == capture_text
+    on_disk = (tmp_path / "accounts" / "pro" / "chatgpt-request.txt").read_text(encoding="utf-8")
+    assert is_encrypted(on_disk)
+    assert on_disk != capture_text
+    assert decrypt_text(on_disk, load_secrets_key(tmp_path / "accounts")) == capture_text
 
 
 def test_admin_save_capture_allows_prepare_capture_without_request_json(tmp_path):

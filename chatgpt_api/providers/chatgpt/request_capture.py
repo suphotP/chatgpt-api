@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from chatgpt_api.providers.chatgpt.crypto import is_encrypted, decrypt_text, load_secrets_key
+
 
 SECRET_HEADER_NAMES = {
     "authorization",
@@ -33,7 +35,12 @@ class CapturedRequest:
 
     @classmethod
     def from_file(cls, path: Path) -> "CapturedRequest":
-        return cls.from_text(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        if is_encrypted(text):
+            # matches the secrets/accounts/<account>/chatgpt-request.txt layout
+            accounts_dir = path.parent.parent
+            text = decrypt_text(text, load_secrets_key(accounts_dir))
+        return cls.from_text(text)
 
     @classmethod
     def from_text(cls, text: str) -> "CapturedRequest":
