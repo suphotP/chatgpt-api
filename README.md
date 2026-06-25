@@ -1,14 +1,134 @@
+<div align="center">
+
 # ChatGPT Web Bridge
 
-Independent local bridge for building real apps on top of ChatGPT Web accounts.
+**A local API bridge for building real apps on top of ChatGPT Web accounts.**
 
-This project provides a local `/v1` HTTP API, an operator console, a CLI, a
-Docker stack, an opencode integration, and a full-stack character game use case.
-It is designed as a provider-first framework: ChatGPT Web is the first provider,
-and the local API gives apps a practical OpenAI-shaped surface without making
-the project depend on any one client.
+Run chat, streaming, image generation, image editing, OCR/vision, Deep Research,
+artifact downloads, opencode integration, and a full-stack character game from
+one local stack.
 
-![Bridge Console overview](docs/assets/screenshots/oss-console-overview.png)
+<p>
+  <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-16a34a?style=for-the-badge">
+  <img alt="Python 3.12" src="https://img.shields.io/badge/python-3.12-2563eb?style=for-the-badge">
+  <img alt="Docker Ready" src="https://img.shields.io/badge/docker-ready-0ea5e9?style=for-the-badge">
+  <img alt="Local First" src="https://img.shields.io/badge/local--first-111827?style=for-the-badge">
+  <img alt="Unofficial" src="https://img.shields.io/badge/unofficial-gray--area-f97316?style=for-the-badge">
+</p>
+
+<p>
+  <a href="#quick-start-with-docker">Quick Start</a>
+  · <a href="#what-this-is">What It Does</a>
+  · <a href="#account-capture">Account Capture</a>
+  · <a href="#api-overview">API Routes</a>
+  · <a href="#image-generation">Images</a>
+  · <a href="#deep-research">Research</a>
+  · <a href="#opencode-integration">opencode</a>
+  · <a href="#documentation-index">Docs</a>
+</p>
+
+</div>
+
+<p align="center">
+  <img alt="Bridge Console overview" src="docs/assets/screenshots/oss-console-overview.png" width="920">
+</p>
+
+## The Pitch
+
+This is for developers who want to put AI into a small web product, internal
+tool, prototype, character game, or local agent workflow before paying for a
+full official API deployment. It gives you a practical local API surface around
+ChatGPT Web capacity you may already have, while keeping the risk and secrets on
+your own machine.
+
+It is not a hosted service and it is not an official API. It is a local bridge,
+an operator console, a CLI, Docker packaging, and concrete use cases that show
+how far a ChatGPT Web account can go when wrapped with sane routing, artifacts,
+downloads, and developer tooling.
+
+> [!IMPORTANT]
+> This is a local developer bridge. It is useful for prototypes, small products,
+> LAN tools, and agent workflows. It is not a public hosted proxy and should not
+> be deployed with shared real account captures.
+
+<table>
+  <tr>
+    <td><strong>Local API</strong><br><code>/v1/chat/completions</code>, images, edits, vision, research, files, admin routes.</td>
+    <td><strong>Account Router</strong><br>Use one account or combine several accounts with failover, round-robin, weighted, or quota-aware routing.</td>
+  </tr>
+  <tr>
+    <td><strong>Operator Console</strong><br>Health, accounts, capacity, docs, storage, test lab, and opencode setup in a dedicated UI.</td>
+    <td><strong>Real Use Case</strong><br>A SvelteKit character/roleplay game shows how a normal web app can consume the bridge.</td>
+  </tr>
+  <tr>
+    <td><strong>Artifacts</strong><br>Images and Deep Research reports are saved to disk and exposed through download URLs for browser/LAN clients.</td>
+    <td><strong>Agent Integration</strong><br>opencode can be pointed at the local bridge for chat, tool-call style flows, image generation, and research.</td>
+  </tr>
+</table>
+
+## Screenshots
+
+| Console | Character Game |
+| --- | --- |
+| <img src="docs/assets/screenshots/oss-console-overview.png" alt="Console overview" width="440"> | <img src="docs/assets/screenshots/oss-game-setup.png" alt="Character game setup" width="440"> |
+
+| API Docs | Storage / Library |
+| --- | --- |
+| <img src="docs/assets/screenshots/oss-console-docs.png" alt="Console docs" width="440"> | <img src="docs/assets/screenshots/oss-console-library.png" alt="Console artifact library" width="440"> |
+
+## Capability Snapshot
+
+| Capability | Route / surface | Current status |
+| --- | --- | --- |
+| Chat and streaming | `POST /v1/chat/completions` | implemented |
+| Tool-call bridge | `tools` through chat completions | implemented |
+| Image generation | `POST /v1/images/generations` | implemented |
+| Image edit / composite | `POST /v1/images/edits` | implemented, one output image |
+| OCR / describe up to 10 images | `POST /v1/chatgpt/vision` | implemented |
+| Deep Research report export | `chatgpt-deep-research` model alias | implemented |
+| File downloads | `GET /v1/chatgpt/files/{id}/{filename}` | implemented |
+| Account usage and limits | `GET /v1/chatgpt/usage` | implemented when ChatGPT reports data |
+| opencode consumer config | `integrations/opencode/*` | implemented |
+| Character game use case | `apps/character-game` | included as a working reference app |
+
+## Tested Plan Notes
+
+| Plan | What is known right now |
+| --- | --- |
+| Free | Live-tested for chat, vision/OCR, multi-image upload, and image edit/composite when quota is available. Multiple free accounts can increase local routing capacity, but hidden ChatGPT limits still apply. |
+| Go | Expected to work through `auto` and plan-limited feature buckets, but not personally verified yet. |
+| Plus | Expected to work with higher quota than Free/Go, but not personally verified yet. |
+| Pro | Live-tested. Higher image/research capacity and higher recommended local concurrency. |
+
+## Latest Validation Snapshot
+
+These checks were run against the local stack before this release.
+
+| Check | Result |
+| --- | --- |
+| Python test suite | `144 passed` |
+| Docker API image build | passed |
+| Docker first run with no account capture | `/health`, `/v1/models`, and capacity work; chat returns a structured `chatgpt_missing_account_capture` error |
+| Multi-image vision request | passed with two input images on a Free account |
+| OCR request | passed on a Free account |
+| Multi-image edit/composite | passed on a Free account and returned a real PNG download URL |
+| Artifact download route | returned a valid PNG file |
+
+## Best Fit
+
+Use this when you want:
+
+- AI chat inside a small web app without immediately paying official API spend
+- image generation or image editing from a ChatGPT subscription you already pay for
+- a local research worker that saves markdown reports for Codex or another agent
+- a character/roleplay game backend with optional scene art
+- a private LAN tool where artifacts need real download URLs
+- a proof of concept before designing a full production AI backend
+
+Do not use it as-is for a public multi-tenant platform. The backend is a
+reference implementation and local bridge. Hosted production needs stronger
+auth, tenant isolation, secret vaulting, request audit, queue durability, abuse
+controls, observability, and deployment hardening.
 
 ## What This Is
 
@@ -31,6 +151,12 @@ local bridge with clear contracts, good operational tooling, and examples that
 show what can be built with it.
 
 ## Unofficial Status, Risk, And Why This Exists
+
+> [!WARNING]
+> This is not official, not affiliated with OpenAI, and not guaranteed to keep
+> working. ChatGPT Web can change, account captures can expire, browser-proof
+> checks can fail, and hidden limits can appear. Use it only with that risk in
+> mind.
 
 This project is **not official** and is not affiliated with OpenAI. It drives
 ChatGPT Web sessions from copied browser request captures and exposes a local
@@ -65,6 +191,12 @@ a reference example for 1024x1024 image generation:
 | medium | `$0.053` |
 | high | `$0.211` |
 
+> [!TIP]
+> For image-heavy experiments, this bridge can be dramatically cheaper than
+> paying per high-quality generated image through an official API, provided you
+> already have ChatGPT Web quota. That does not remove the gray-area risk or
+> hidden burst limits.
+
 This bridge lets local tools use capacity you may already have in ChatGPT Web:
 image generation, image editing/compositing, OCR/vision, and Deep Research.
 That can also avoid burning Codex usage on tasks Codex is not best suited for:
@@ -79,14 +211,8 @@ not just a terminal demo. If you later turn the idea into a serious hosted
 product, move to a proper production architecture and budget for official APIs
 or a hardened provider layer.
 
-Plan support is intentionally conservative:
-
-| Plan | Current project expectation | Personally tested in this repo |
-| --- | --- | --- |
-| Free | Works for chat plus limited feature buckets exposed by ChatGPT Web. Current live checks include vision/OCR, multi-image upload, and image edit/composite when quota is available. Multiple free accounts can increase local routing capacity, subject to ChatGPT limits. | yes |
-| Go | Expected to work through `auto` and plan-limited feature buckets. | not yet |
-| Plus | Expected to work with higher quota than Free/Go. | not yet |
-| Pro | Works with higher image/research capacity and higher recommended local concurrency. | yes |
+Plan support is intentionally conservative. See [Tested Plan Notes](#tested-plan-notes)
+for the current verified matrix.
 
 The local router can combine several accounts, including free accounts, so chat
 capacity can be much higher than a single account. This does not mean the
@@ -112,6 +238,11 @@ contracting, and consulting opportunities around AI tooling, local agents,
 automation, full-stack product prototypes, and developer infrastructure.
 
 ## Open Source Scope
+
+> [!NOTE]
+> The console and game are included to prove the use cases, not to claim they
+> are final commercial UI. The backend is intentionally scoped as a local bridge
+> and example product foundation.
 
 This is an MIT-licensed open-source project built to make the idea usable and
 testable, not to provide a fully polished commercial product for free.
@@ -156,14 +287,24 @@ bridge-specific by design.
 
 ## Quick Start With Docker
 
-Docker is the fastest way to see the whole system. The containers can start
-without any ChatGPT account capture, but real chat, image, OCR, and research
-requests need at least one saved account.
+Docker is the fastest way to see the whole system: API, Console, Character
+Game, storage, and docs.
+
+### Five-Minute Path
+
+| Time | Action | Result |
+| --- | --- | --- |
+| 1 min | Copy `.env.example` and start Docker | Console, API health, docs, and game shell are online. |
+| 2 min | Add one ChatGPT account capture | Chat, image, vision/OCR, and research routes can use that account. |
+| 1 min | Run capacity check | See accounts, model aliases, local concurrency, quota metadata, and artifact paths. |
+| 1 min | Try the game or API examples | Confirm the bridge works as an app backend, not only a CLI demo. |
 
 | Step | What works | What still needs an account capture |
 | --- | --- | --- |
 | Start Docker with no captures | API health, Console, docs, storage view, model aliases, Character Game shell | Real ChatGPT chat/image/research calls |
 | Add one account capture | Chat, streaming, image generation, OCR/vision, research according to that account's plan and limits | More capacity/failover needs more accounts |
+
+### Start The Stack
 
 ```sh
 cp .env.example .env
@@ -171,7 +312,7 @@ mkdir -p secrets/accounts outputs
 docker compose up --build
 ```
 
-Open:
+### Open The Surfaces
 
 ```text
 API health:     http://127.0.0.1:8000/health
@@ -181,21 +322,19 @@ Character game: http://127.0.0.1:3000
 Bearer key:     local-dev-key
 ```
 
-Health check:
+### Smoke Test
 
 ```sh
 curl 'http://127.0.0.1:8000/health' \
   -H 'Authorization: Bearer local-dev-key'
-```
 
-Model list:
-
-```sh
 curl 'http://127.0.0.1:8000/v1/models' \
   -H 'Authorization: Bearer local-dev-key'
 ```
 
-Add your first account from the Console:
+### Add Your First Account
+
+Console flow:
 
 1. Open `http://127.0.0.1:8080`.
 2. Go to Accounts.
@@ -204,7 +343,7 @@ Add your first account from the Console:
 5. Save. The Console inspects required fields first and then live-verifies the
    account before routing it.
 
-Or add it from the CLI while Docker is running:
+CLI flow while Docker is running:
 
 ```sh
 python3 -m chatgpt_api admin account add --paste \
@@ -274,6 +413,10 @@ selectors.
 Each ChatGPT account needs one copied browser request capture. The capture
 contains cookies, bearer tokens, and browser proof headers. Treat it like a
 password.
+
+> [!CAUTION]
+> Account captures are credentials. Never commit them, paste them into public
+> issues, or share them with hosted services you do not control.
 
 Supported capture paths today:
 
