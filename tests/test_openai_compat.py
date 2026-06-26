@@ -1,5 +1,8 @@
 import base64
+import http.client
 import json
+import threading
+from http.server import HTTPServer
 
 import pytest
 
@@ -95,6 +98,32 @@ def test_account_router_weighted_prefers_high_weight_accounts():
     assert "pro" in first_accounts
 
 
+def test_account_router_random_shuffles_account_order(monkeypatch):
+    monkeypatch.setattr(compat.random, "sample", lambda population, k: list(reversed(population)))
+    router = AccountRouter(("free", "go", "plus", "pro"), "random")
+
+    assert router.order() == ("pro", "plus", "go", "free")
+
+
+def test_router_for_request_can_override_accounts_and_strategy():
+    config = OpenAICompatConfig(account="free", accounts=("free", "pro"), account_strategy="failover")
+    router = compat._router_for_request(
+        config,
+        AccountRouter(("free", "pro"), "failover"),
+        {"chatgpt_accounts": ["pro"], "chatgpt_account_strategy": "round-robin"},
+    )
+
+    assert router.accounts == ("pro",)
+    assert router.strategy == "round-robin"
+
+
+def test_router_for_request_rejects_unknown_accounts():
+    config = OpenAICompatConfig(account="free", accounts=("free", "pro"), account_strategy="failover")
+
+    with pytest.raises(ValueError, match="unknown ChatGPT account alias"):
+        compat._router_for_request(config, None, {"chatgpt_account": "missing"})
+
+
 def test_provider_error_payload_includes_account_attempts():
     error = OpenAICompatProviderError(
         ProviderError("ChatGPT conversation returned empty assistant text."),
@@ -120,6 +149,18 @@ def test_classify_cloudflare_browser_challenge():
     assert error_type == "provider_auth_error"
     assert status == 401
     assert "Cloudflare" in hint
+
+
+def test_classify_cancelled_operation():
+    code, error_type, status, hint = _classify_provider_error(
+        "ChatGPT Deep Research cancelled",
+        None,
+    )
+
+    assert code == "chatgpt_operation_cancelled"
+    assert error_type == "request_cancelled"
+    assert status == 499
+    assert "cancelled" in hint
 
 
 def test_provider_error_payload_for_missing_account_capture():
@@ -357,7 +398,7 @@ def test_multi_account_chat_falls_back_after_provider_error(monkeypatch):
     def fake_provider_for_account(config, account=None):
         return FakeProvider(account or config.account)
 
-    async def fake_collect_messages_text(provider, messages, model_slug, thinking_effort, temporary_chat):
+    async def fake_collect_messages_text(provider, messages, model_slug, thinking_effort, temporary_chat, operation_id=None):
         assert temporary_chat is True
         calls.append(provider.account)
         if provider.account == "free":
@@ -449,6 +490,86 @@ def test_cancel_chatgpt_operation_calls_stop_conversation():
     assert stop_calls == [("conversation-1", ["pro_mode"])]
 
 
+def test_get_research_operation_reports_ready_state():
+    operation = compat._create_chatgpt_operation("research", "chatgptop_ready_test")
+    compat._update_chatgpt_operation(
+        operation.operation_id,
+        provider=object(),
+        account="pro",
+        conversation_id="conversation-1",
+        deep_research_message_id="message-1",
+        deep_research_session_id="session-1",
+    )
+
+    status, payload = compat._get_chatgpt_operation(operation.operation_id)
+
+    assert status == 200
+    assert payload["operation"]["provider_selected"] is True
+    assert payload["operation"]["deep_research_ready"] is True
+    assert payload["operation"]["deep_research_message_id"] == "message-1"
+    assert payload["operation"]["deep_research_session_id"] == "session-1"
+    assert payload["operation"]["pending_reason"] is None
+
+
+def test_cancel_research_operation_reports_pending_widget_session():
+    class FakeTransport:
+        def stop_conversation(self, conversation_id, *, exclude_async_types=None):
+            return {"status": "ok"}
+
+    class FakeProvider:
+        transport = FakeTransport()
+
+    operation = compat._create_chatgpt_operation("research", "chatgptop_pending_test")
+    compat._update_chatgpt_operation(
+        operation.operation_id,
+        provider=FakeProvider(),
+        account="pro",
+        conversation_id="conversation-1",
+    )
+
+    status, payload = compat._cancel_chatgpt_operation(operation.operation_id)
+
+    assert status == 200
+    assert payload["operation"]["deep_research_ready"] is False
+    assert payload["operation"]["pending_reason"] == "deep_research_session_not_available"
+    assert payload["operation"]["last_cancel_result"]["deep_research_pending"] == "widget_session_id_not_available"
+
+
+def test_non_stream_chat_tracks_client_operation_id(monkeypatch):
+    seen = {}
+
+    class FakeProvider:
+        def __init__(self, account):
+            self.account = account
+
+    async def fake_collect_messages_text(provider, messages, model_slug, thinking_effort, temporary_chat, operation_id=None):
+        seen["operation_id"] = operation_id
+        compat._update_chatgpt_operation(operation_id, conversation_id="conversation-1")
+        return "tracked"
+
+    monkeypatch.setattr(compat, "_provider_for_account", lambda config, account=None: FakeProvider(account or config.account))
+    monkeypatch.setattr(compat, "_collect_messages_text", fake_collect_messages_text)
+
+    response = compat.asyncio.run(
+        compat._chat_completion(
+            OpenAICompatConfig(account="pro", accounts=("pro",)),
+            {
+                "model": "auto",
+                "messages": [{"role": "user", "content": "hello"}],
+                "metadata": {"chatgpt_operation_id": "chatgptop_chat_test"},
+            },
+        )
+    )
+    status, payload = compat._get_chatgpt_operation("chatgptop_chat_test")
+
+    assert response["chatgpt_operation_id"] == "chatgptop_chat_test"
+    assert seen["operation_id"] == "chatgptop_chat_test"
+    assert status == 200
+    assert payload["operation"]["account"] == "pro"
+    assert payload["operation"]["conversation_id"] == "conversation-1"
+    assert payload["operation"]["completed"] is True
+
+
 def test_chat_falls_back_to_auto_model_after_empty_explicit_model(monkeypatch):
     calls = []
 
@@ -456,7 +577,7 @@ def test_chat_falls_back_to_auto_model_after_empty_explicit_model(monkeypatch):
         def __init__(self, account):
             self.account = account
 
-    async def fake_collect_prompt_text(provider, prompt, model_slug, thinking_effort, temporary_chat):
+    async def fake_collect_prompt_text(provider, prompt, model_slug, thinking_effort, temporary_chat, operation_id=None):
         assert temporary_chat is True
         calls.append((provider.account, model_slug, thinking_effort))
         if model_slug == "gpt-5-5-pro":
@@ -486,7 +607,7 @@ def test_deep_research_uses_normal_chat_and_bypasses_tool_prompt(monkeypatch, tm
         def __init__(self, account):
             self.account = account
 
-    async def fake_collect_deep_research_text(provider, prompt, model_slug):
+    async def fake_collect_deep_research_text(provider, prompt, model_slug, operation_id=None):
         seen["account"] = provider.account
         seen["prompt"] = prompt
         seen["model_slug"] = model_slug
@@ -520,6 +641,39 @@ def test_deep_research_uses_normal_chat_and_bypasses_tool_prompt(monkeypatch, tm
     assert compat.Path(response["chatgpt_research_report_path"]).read_text(encoding="utf-8") == "research result"
 
 
+def test_deep_research_uses_client_operation_id(monkeypatch, tmp_path):
+    seen = {}
+
+    class FakeProvider:
+        def __init__(self, account):
+            self.account = account
+
+    async def fake_collect_deep_research_with_accounts(config, router, prompt, requested_model, model_slug, operation_id=None):
+        seen["operation_id"] = operation_id
+        seen["router_accounts"] = router.accounts
+        return "pro", FakeProvider("pro"), "research result", {"status": "completed"}
+
+    monkeypatch.setattr(compat, "_collect_deep_research_with_accounts", fake_collect_deep_research_with_accounts)
+
+    response = compat.asyncio.run(
+        compat._chat_completion(
+            OpenAICompatConfig(account="free", accounts=("free", "pro"), account_strategy="failover", research_output_dir=tmp_path),
+            {
+                "model": "chatgpt-deep-research",
+                "messages": [{"role": "user", "content": "research this"}],
+                "chatgpt_operation_id": "chatgptop_custom",
+                "chatgpt_account": "pro",
+            },
+        )
+    )
+
+    assert seen == {"operation_id": "chatgptop_custom", "router_accounts": ("pro",)}
+    assert response["chatgpt_operation_id"] == "chatgptop_custom"
+    assert response["chatgpt_account"] == "pro"
+    with compat._CHATGPT_OPERATIONS_LOCK:
+        assert compat._CHATGPT_OPERATIONS["chatgptop_custom"].completed is True
+
+
 def test_deep_research_accepts_opencode_provider_prefixed_model(monkeypatch, tmp_path):
     seen = {}
 
@@ -527,7 +681,7 @@ def test_deep_research_accepts_opencode_provider_prefixed_model(monkeypatch, tmp
         def __init__(self, account):
             self.account = account
 
-    async def fake_collect_deep_research_text(provider, prompt, model_slug):
+    async def fake_collect_deep_research_text(provider, prompt, model_slug, operation_id=None):
         seen["account"] = provider.account
         seen["prompt"] = prompt
         seen["model_slug"] = model_slug
@@ -581,7 +735,7 @@ def test_deep_research_skips_account_with_exhausted_preflight_limit(monkeypatch,
             }
         return {"limits_progress": [{"feature_name": "deep_research", "remaining": 3}]}
 
-    async def fake_collect_deep_research_text(provider, prompt, model_slug):
+    async def fake_collect_deep_research_text(provider, prompt, model_slug, operation_id=None):
         calls.append(provider.account)
         return "research from pro", {"status": "completed"}
 
@@ -849,6 +1003,60 @@ def test_account_order_prefers_accounts_that_support_requested_model(monkeypatch
     ) == ("pro", "unknown", "free")
 
 
+def test_usage_preflight_rank_treats_unreported_feature_as_available():
+    requirements = ((("file_upload", "attachments", "attachment"), 1),)
+
+    assert compat._usage_preflight_rank({"limits_progress": []}, requirements)[0] == 0
+    assert (
+        compat._usage_preflight_rank(
+            {"limits_progress": [{"feature_name": "file_upload", "remaining": 0}]},
+            requirements,
+        )[0]
+        == 2
+    )
+
+
+def test_vision_prioritizes_account_with_file_upload_capacity(monkeypatch, tmp_path):
+    init_calls = []
+    chat_calls = []
+    image = "data:image/png;base64," + base64.b64encode(b"vision").decode("ascii")
+
+    class FakeProvider:
+        def __init__(self, account):
+            self.account = account
+
+    async def fake_conversation_init_metadata(provider, provider_model):
+        init_calls.append(provider.account)
+        if provider.account == "free":
+            return {"limits_progress": [{"feature_name": "file_upload", "remaining": 0}]}
+        return {"limits_progress": []}
+
+    async def fake_collect_messages_text(provider, messages, model_slug, thinking_effort, temporary_chat, operation_id=None):
+        chat_calls.append(provider.account)
+        return "vision from pro"
+
+    monkeypatch.setattr(compat, "_provider_for_account", lambda config, account=None: FakeProvider(account or config.account))
+    monkeypatch.setattr(compat, "_conversation_init_metadata", fake_conversation_init_metadata)
+    monkeypatch.setattr(compat, "_collect_messages_text", fake_collect_messages_text)
+
+    response = compat.asyncio.run(
+        compat._vision_request(
+            OpenAICompatConfig(
+                account="free",
+                accounts=("free", "pro"),
+                account_strategy="failover",
+                image_output_dir=tmp_path,
+            ),
+            {"model": "auto", "mode": "ocr", "images": [image]},
+        )
+    )
+
+    assert init_calls == ["free", "pro"]
+    assert chat_calls == ["pro"]
+    assert response["chatgpt_account"] == "pro"
+    assert response["text"] == "vision from pro"
+
+
 def test_multi_account_image_generation_falls_back_after_provider_error(monkeypatch, tmp_path):
     calls = []
 
@@ -948,6 +1156,42 @@ def test_image_generation_response_saves_downloaded_image_bytes(tmp_path):
     assert response["data"][0]["file_id"]
 
 
+def test_download_file_route_supports_head_and_get(tmp_path):
+    artifact_path = tmp_path / "icon.png"
+    artifact_path.write_bytes(b"png-bytes")
+    admin_db_path = tmp_path / "admin.sqlite"
+    asset = compat._register_download_file(artifact_path, content_type="image/png", admin_db_path=admin_db_path)
+    download_path = asset["download_url"]
+    with compat._DOWNLOAD_FILES_LOCK:
+        compat._DOWNLOAD_FILES.pop(asset["id"], None)
+    server = HTTPServer(
+        ("127.0.0.1", 0),
+        compat._handler_class(OpenAICompatConfig(account="test", api_key="test-key", admin_db_path=admin_db_path)),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        conn.request("HEAD", download_path)
+        head_response = conn.getresponse()
+        head_response.read()
+        assert head_response.status == 200
+        assert head_response.getheader("Content-Type") == "image/png"
+        assert head_response.getheader("Content-Length") == str(len(b"png-bytes"))
+        assert "icon.png" in (head_response.getheader("Content-Disposition") or "")
+
+        conn.request("GET", download_path)
+        get_response = conn.getresponse()
+        assert get_response.status == 200
+        assert get_response.read() == b"png-bytes"
+    finally:
+        conn.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_chat_image_request_saves_to_requested_path(monkeypatch, tmp_path):
     requested_path = tmp_path / "cat.png"
 
@@ -993,7 +1237,7 @@ def test_chat_image_request_does_not_repeat_after_assistant_response(monkeypatch
             calls["image"] += 1
             raise AssertionError("image generation should not repeat after assistant response")
 
-    async def fake_collect_messages_text(provider, messages, model_slug, thinking_effort, temporary_chat):
+    async def fake_collect_messages_text(provider, messages, model_slug, thinking_effort, temporary_chat, operation_id=None):
         calls["text"] += 1
         return "Already saved."
 
@@ -1133,6 +1377,57 @@ def test_image_edit_uses_multiple_input_images_and_one_output(monkeypatch, tmp_p
     assert response["aspect_ratio"] == "1:1"
     assert response["data"][0]["download_url"]
     assert (tmp_path / response["data"][0]["filename"]).exists()
+
+
+def test_image_edit_prioritizes_account_with_file_upload_capacity(monkeypatch, tmp_path):
+    init_calls = []
+    image_calls = []
+    image_path = tmp_path / "ref.png"
+    image_path.write_bytes(b"ref")
+
+    class FakeProvider:
+        def __init__(self, account):
+            self.account = account
+
+        async def generate_image(self, request):
+            image_calls.append(self.account)
+            return ImageResponse(images=[ImageAsset(data=b"edited", mime_type="image/png")], prompt=request.prompt)
+
+    async def fake_init_metadata(provider, model):
+        init_calls.append(provider.account)
+        if provider.account == "free":
+            return {
+                "limits_progress": [
+                    {"feature_name": "image_gen", "remaining": 10},
+                    {"feature_name": "file_upload", "remaining": 0},
+                ]
+            }
+        return {"limits_progress": [{"feature_name": "image_gen", "remaining": 1}]}
+
+    monkeypatch.setattr(compat, "_provider_for_account", lambda config, account=None: FakeProvider(account or config.account))
+    monkeypatch.setattr(compat, "_conversation_init_metadata", fake_init_metadata)
+
+    response = compat.asyncio.run(
+        _image_edit(
+            OpenAICompatConfig(
+                account="free",
+                accounts=("free", "pro"),
+                account_strategy="failover",
+                image_output_dir=tmp_path,
+            ),
+            {
+                "model": "auto",
+                "prompt": "edit this icon",
+                "images": [str(image_path)],
+                "response_format": "url",
+            },
+        )
+    )
+
+    assert init_calls == ["free", "pro"]
+    assert image_calls == ["pro"]
+    assert response["chatgpt_account"] == "pro"
+    assert response["data"][0]["download_url"]
 
 
 def test_models_for_config_includes_openai_image_alias(monkeypatch):

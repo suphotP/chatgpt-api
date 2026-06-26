@@ -7,9 +7,9 @@ services:
       CHATGPT_API_HOST: 0.0.0.0
       CHATGPT_API_PORT: 8000
       CHATGPT_API_KEY: ${CHATGPT_API_KEY:-local-dev-key}
-      # These are local account aliases under secrets/accounts, not ChatGPT plan names.
-      CHATGPT_ACCOUNT: ${CHATGPT_ACCOUNT:-free-main}
-      CHATGPT_ACCOUNTS: ${CHATGPT_ACCOUNTS:-free-main,pro-main}
+      # Optional local account aliases under secrets/accounts. Leave blank to auto-discover every saved capture.
+      CHATGPT_ACCOUNT: ${CHATGPT_ACCOUNT:-}
+      CHATGPT_ACCOUNTS: ${CHATGPT_ACCOUNTS:-}
       CHATGPT_ACCOUNT_STRATEGY: ${CHATGPT_ACCOUNT_STRATEGY:-failover}
       CHATGPT_ACCOUNTS_DIR: /data/secrets/accounts
       CHATGPT_IMAGE_OUTPUT_DIR: /data/outputs/chatgpt-images

@@ -65,6 +65,11 @@
       "Round robin",
       "Rotate account order for separate requests.",
     ],
+    [
+      "random",
+      "Random",
+      "Shuffle account order per request while keeping failover fallbacks.",
+    ],
     ["sticky", "Sticky", "Use the first selected account only."],
     [
       "weighted",
@@ -167,10 +172,43 @@
           type: "object",
           defaultValue: "optional",
           meaning:
-            "Bridge-specific switches can also be passed here, such as agent_mode, deep_research, output_dir, or operation id.",
+            "Bridge-specific switches can also be passed here, such as agent_mode, deep_research, output_dir, route overrides, or operation id.",
           recommended:
             "Use metadata for app-owned values so your normal message content stays clean.",
           gotcha: "Do not put secrets into metadata if you store transcripts.",
+        },
+        {
+          name: "chatgpt_account",
+          type: "string",
+          defaultValue: "server router",
+          meaning:
+            "Request one local account alias for this call. Same as CLI --account.",
+          recommended:
+            "Use for debug, paid-only workflows, or a user-selected account.",
+          gotcha:
+            "This is a local alias like pro-main or free-2, not a ChatGPT plan name.",
+        },
+        {
+          name: "chatgpt_accounts",
+          type: "array / comma string",
+          defaultValue: "server accounts",
+          meaning:
+            "Restricts this request to a set of local account aliases. Same as CLI --accounts.",
+          recommended:
+            "Use with chatgpt_account_strategy for per-request failover or quota-aware routing.",
+          gotcha:
+            "Unknown aliases are rejected before provider work starts.",
+        },
+        {
+          name: "chatgpt_account_strategy",
+          type: "auto | sticky | failover | random | round-robin | weighted | quota-aware",
+          defaultValue: "server strategy",
+          meaning:
+            "Per-request account routing strategy. Same as CLI --account-strategy.",
+          recommended:
+            "failover for simple apps, random for loose free-account pools, quota-aware for image/research-heavy apps after testing.",
+          gotcha:
+            "Local routing cannot bypass ChatGPT Web hidden rate limits.",
         },
       ],
     },
@@ -261,9 +299,9 @@
           meaning:
             "Source image inputs uploaded to ChatGPT before the edit prompt is sent.",
           recommended:
-            "Use local paths on the API host, public URLs, or data URLs from browser clients.",
+            "Use local paths on the API host, public URLs, or data URLs from browser clients. These inputs need file_upload capacity when ChatGPT reports it.",
           gotcha:
-            "All OCR/edit/composite calls share the upload concurrency bucket and ChatGPT file_upload quota.",
+            "All OCR/edit/composite calls share the upload concurrency bucket and ChatGPT file_upload quota. not_reported is treated as unknown capacity, not blocked.",
         },
         {
           name: "aspect_ratio",
@@ -320,9 +358,9 @@
           defaultValue: "required",
           meaning: "One to 10 images uploaded into the ChatGPT conversation.",
           recommended:
-            "Keep each request focused. Use multiple images only when comparing or combining context.",
+            "Keep each request focused. These inputs consume the account file_upload bucket when ChatGPT reports it.",
           gotcha:
-            "The bridge preflights file_upload quota when ChatGPT reports it, but hidden burst limits can still happen.",
+            "not_reported means the account did not expose that counter, not that the route is blocked. Hidden burst limits can still happen.",
         },
       ],
     },
@@ -373,6 +411,17 @@
           gotcha:
             "The chat response intentionally returns only done/path/download URL, not the full report body.",
         },
+        {
+          name: "chatgpt_operation_id",
+          type: "string",
+          defaultValue: "auto",
+          meaning:
+            "Client-provided id used by /v1/chatgpt/operations/{id}/cancel.",
+          recommended:
+            "Generate one before starting research so another terminal, tab, or AbortController can cancel it.",
+          gotcha:
+            "Operation ids are live runtime records, not durable history. Research cancel needs the connector session ids first; the bridge reads them from the WSS widget stream, then sends the Deep Research MCP stop call.",
+        },
       ],
     },
     {
@@ -397,7 +446,7 @@
           meaning:
             "Copied Network request details from POST /backend-api/f/conversation.",
           recommended:
-            "Paste Chrome/Safari Headers + Payload, Safari Request Data, or full Copy as cURL output with all -H headers and --data-raw.",
+            "Paste Chrome/Safari Headers + Payload, Safari Request Data, or full Copy as cURL output with Authorization, Cookie or -b cookies, and --data-raw.",
           gotcha:
             "Do not commit capture files; they contain session cookies/tokens.",
         },
@@ -504,7 +553,7 @@
     ],
     [
       "Strategy",
-      "How account order is chosen: failover, quota-aware, round-robin, sticky, or weighted.",
+      "How account order is chosen: failover, random, quota-aware, round-robin, sticky, or weighted.",
     ],
     [
       "Agent prompt mode",
@@ -678,8 +727,8 @@
   let serverHost = $state("127.0.0.1");
   let serverPort = $state("8000");
   let serverKey = $state(DEFAULT_API_KEY);
-  let serverAccount = $state("pro");
-  let serverAccounts = $state("free-main,pro-main");
+  let serverAccount = $state("");
+  let serverAccounts = $state("");
   let serverStrategy = $state("failover");
   let serverPublicBase = $state("http://127.0.0.1:8000/v1");
   let imageOutputDir = $state("outputs/chatgpt-images");
@@ -705,7 +754,7 @@
   );
   const accountNames = $derived(
     Array.from(
-      new Set(["free", "pro", ...accounts.map((account) => account.account)]),
+      new Set(["free", "go", "plus", "pro", ...accounts.map((account) => account.account)]),
     ).filter(Boolean),
   );
   const selectedServerAccounts = $derived(splitCsv(serverAccounts));
@@ -1383,15 +1432,15 @@
       serverPort = LOCAL_API_PORT;
       serverPublicBase = `http://${LOCAL_API_HOST}:${LOCAL_API_PORT}/v1`;
       serverStrategy = "failover";
-      serverAccounts = "free-main,pro-main";
-      serverAccount = "pro";
+      serverAccounts = "";
+      serverAccount = "";
     } else if (preset === "lan") {
       serverHost = "0.0.0.0";
       serverPort = LOCAL_API_PORT;
       serverPublicBase = `http://YOUR-LAN-IP:${LOCAL_API_PORT}/v1`;
       serverStrategy = "failover";
-      serverAccounts = "free-main,pro-main";
-      serverAccount = "pro";
+      serverAccounts = "";
+      serverAccount = "";
     } else if (preset === "pro") {
       serverHost = LOCAL_API_HOST;
       serverPort = LOCAL_API_PORT;
@@ -1417,7 +1466,7 @@
         id: "local",
         title: "Local dev",
         body: "Use this machine only. Good default for testing the bridge and console.",
-        values: "host 127.0.0.1 · accounts free-main,pro-main · failover",
+        values: "host 127.0.0.1 · accounts auto-discover · failover",
       },
       {
         id: "lan",
@@ -1523,6 +1572,23 @@
         }),
       },
       {
+        title: "Chat with account routing",
+        path: "POST /v1/chat/completions",
+        note: "Per-request routing override. Use local account aliases, not plan names.",
+        code: curl("POST", "/chat/completions", {
+          model: "auto",
+          messages: [
+            {
+              role: "user",
+              content: "Say which routed account handled this if available.",
+            },
+          ],
+          chatgpt_accounts: ["free", "go", "plus", "pro"],
+          chatgpt_account_strategy: "random",
+          stream: false,
+        }),
+      },
+      {
         title: "Carry conversation context",
         path: "POST /v1/chat/completions",
         note: "The bridge does not magically know your app session. Send prior messages you want the model to remember.",
@@ -1577,7 +1643,7 @@
       {
         title: "Deep Research",
         path: "POST /v1/chat/completions",
-        note: "Uses the Deep Research connector, forces normal chat mode internally, skips the 60s wait when possible, and saves a markdown report.",
+        note: "Uses the Deep Research connector, forces normal chat mode internally, skips the 60s wait when possible, and saves a markdown report. Provide chatgpt_operation_id if your UI needs cancel.",
         code: curl("POST", "/chat/completions", {
           model: "chatgpt-deep-research",
           messages: [
@@ -1586,13 +1652,23 @@
               content: "Briefly research whether LLMs could reach AGI.",
             },
           ],
+          chatgpt_operation_id: "chatgptop_research_demo",
           output_dir: "outputs/chatgpt-research",
         }),
       },
       {
+        title: "Operation status",
+        path: "GET /v1/chatgpt/operations/{id}",
+        note: "Poll this before cancelling long jobs. For Deep Research, wait for deep_research_ready=true before expecting the MCP stop call to be immediate.",
+        code: curl(
+          "GET",
+          "/chatgpt/operations/chatgptop_REPLACE_ME",
+        ),
+      },
+      {
         title: "Cancel operation",
         path: "POST /v1/chatgpt/operations/{id}/cancel",
-        note: "Use when the client aborts, closes a tab, or receives Ctrl-C.",
+        note: "Use when the client aborts, closes a tab, or receives Ctrl-C. Deep Research cancel is best effort until operation status shows deep_research_ready=true.",
         code: curl(
           "POST",
           "/chatgpt/operations/chatgptop_REPLACE_ME/cancel",
@@ -1679,6 +1755,38 @@
         ),
       },
       {
+        title: "API health from CLI",
+        note: "Read-only consumer check. This goes through the same /v1 server target as apps.",
+        code: shell(
+          `python3 -m chatgpt_api api health --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+        ),
+      },
+      {
+        title: "API chat with routing",
+        note: "Tests the real app route with per-request accounts and strategy overrides.",
+        code: shell(
+          `python3 -m chatgpt_api api chat --message 'Reply with exactly: bridge ok' --accounts free,go,plus,pro --account-strategy random --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+        ),
+      },
+      {
+        title: "API image generation",
+        note: "Calls /v1/images/generations and saves only completed image artifacts.",
+        code: shell(
+          `python3 -m chatgpt_api api image --prompt 'small blue app icon, no text' --output-dir ./outputs/manual-images --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+        ),
+      },
+      {
+        title: "API research and cancel",
+        note: "Start with a known operation id, poll until deep_research_ready=yes, then cancel from another terminal if needed.",
+        code: shell(
+          [
+            `python3 -m chatgpt_api api research --prompt 'Briefly research whether LLMs could reach AGI.' --operation-id chatgptop_research_demo --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+            `python3 -m chatgpt_api api operation --operation-id chatgptop_research_demo --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+            `python3 -m chatgpt_api api cancel --operation-id chatgptop_research_demo --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+          ].join("\n"),
+        ),
+      },
+      {
         title: "Set runtime limits",
         note: "Persists per-plan/per-account throttles into the admin SQLite DB.",
         code: shell(
@@ -1689,7 +1797,7 @@
         title: "Save account capture",
         note: "Fails before writing if the copied request is incomplete. Use it to refresh an expired account capture safely.",
         code: shell(
-          `python3 -m chatgpt_api admin save-capture --account pro-main --capture-file ./chatgpt-request.txt --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
+          `python3 -m chatgpt_api admin save-capture --account plus-main --capture-file ./chatgpt-request.txt --base-url ${quoteShell(baseUrl)} --api-key ${quoteShell(apiKey || DEFAULT_API_KEY)}`,
         ),
       },
       {
@@ -1705,7 +1813,7 @@
         code: shell(
           [
             `CHATGPT_API_KEY=${quoteShell(apiKey || DEFAULT_API_KEY)} \\`,
-            `CHATGPT_ACCOUNTS=${quoteShell(serverAccounts)} \\`,
+            ...(serverAccounts.trim() ? [`CHATGPT_ACCOUNTS=${quoteShell(serverAccounts)} \\`] : []),
             `CHATGPT_API_HOST=0.0.0.0 \\`,
             `CHATGPT_API_PORT=${quoteShell(serverPort)} \\`,
             `CHATGPT_PUBLIC_BASE_URL=${quoteShell(serverPublicBase)} \\`,
@@ -2026,9 +2134,11 @@
         kind: "research",
         read: "chatgpt_research_report_download_url",
         files: "Markdown report saved in research output dir",
-        operation: "Long job; cancel with operation id if client exits",
+        operation:
+          "Long job; cancel with operation id. WSS discovers the widget session, then MCP stop is sent.",
         response: {
           id: "chatcmpl_research",
+          chatgpt_operation_id: "chatgptop_research_demo",
           chatgpt_research_report_path: "/local/outputs/research/report.md",
           chatgpt_research_report_download_url: `${fileBase}/chatgpt/files/file_report/report.md`,
           choices: [
@@ -2041,24 +2151,52 @@
         },
       },
       {
-        route: "GET /v1/chatgpt/files/{file_id}/{filename}",
+        route: "GET/HEAD /v1/chatgpt/files/{file_id}/{filename}",
         kind: "download",
         read: "binary file body",
         files: "Works for images and markdown reports",
-        operation: "Use public_base_url for LAN clients",
-        response: "HTTP 200 with Content-Type and Content-Disposition headers",
+        operation: "Use public_base_url for LAN clients. URLs restore from the admin DB after API restart when the file still exists.",
+        response: "GET returns the file body. HEAD returns Content-Type, Content-Length, and Content-Disposition without a body.",
+      },
+      {
+        route: "GET /v1/chatgpt/operations/{id}",
+        kind: "operation",
+        read: "selected account, conversation id, Deep Research readiness, cancel state",
+        files: "none",
+        operation:
+          "Poll this before manual Deep Research cancel; deep_research_ready=true means the widget session id is known.",
+        response: {
+          object: "chatgpt.operation",
+          operation: {
+            id: "chatgptop_REPLACE_ME",
+            kind: "research",
+            account: "pro",
+            provider_selected: true,
+            conversation_id: "conversation-id",
+            deep_research_ready: true,
+            pending_reason: null,
+            cancel_requested: false,
+            completed: false,
+          },
+        },
       },
       {
         route: "POST /v1/chatgpt/operations/{id}/cancel",
         kind: "cancel",
         read: "ok + cancel result",
         files: "no new file should be registered after cancel",
-        operation: "Call from Ctrl-C, tab close, AbortController, or UI cancel",
+        operation:
+          "Call from Ctrl-C, tab close, AbortController, or UI cancel. For Deep Research, poll operation first when possible.",
         response: {
-          object: "chatgpt.operation.cancel",
-          ok: true,
-          operation_id: "chatgptop_REPLACE_ME",
-          cancel: { conversation: { status: "ok" } },
+          status: "ok",
+          operation: {
+            id: "chatgptop_REPLACE_ME",
+            kind: "research",
+            deep_research_ready: true,
+            cancel_requested: true,
+            completed: false,
+            last_cancel_result: { conversation: { status: "ok" } },
+          },
         },
       },
       {
@@ -2244,12 +2382,8 @@
   }
 
   function buildServeCommand() {
-    const args = [
+    const args: string[] = [
       "python3 -m chatgpt_api serve",
-      "--account",
-      quoteShell(serverAccount),
-      "--accounts",
-      quoteShell(serverAccounts),
       "--account-strategy",
       quoteShell(serverStrategy),
       "--host",
@@ -2282,6 +2416,12 @@
       quoteShell(modelFallback),
       temporaryChat ? "--temporary-chat" : "--normal-chat",
     ];
+    if (!serverAccounts.trim() && serverAccount.trim()) {
+      args.splice(1, 0, "--account", quoteShell(serverAccount));
+    }
+    if (serverAccounts.trim()) {
+      args.splice(1, 0, "--accounts", quoteShell(serverAccounts));
+    }
     return args.join(" ");
   }
 
@@ -2471,7 +2611,7 @@
         output:
           "Vision returns assistant text or prompt-shaped JSON; edits save one image into " +
           String(storage.image_output_dir ?? imageOutputDir),
-        note: "Up to 10 source images per request. OCR bbox JSON is model-estimated; editing/compositing returns exactly one final image.",
+        note: "Up to 10 source images per request. This consumes file_upload when reported. OCR bbox JSON is model-estimated; editing/compositing returns exactly one final image.",
       },
       {
         id: "image",
@@ -2674,7 +2814,7 @@
       {
         path: "/v1/chatgpt/files/{id}/{name}",
         status: online ? "OK" : "WARN",
-        latency: "download",
+        latency: "GET/HEAD",
         success: `${artifacts.length} indexed`,
       },
     ];
@@ -3232,8 +3372,9 @@
                 >POST /backend-api/f/conversation</span
               >
               request from the new ChatGPT account at a time. A valid capture
-              must include URL, Authorization, Cookie, and the request JSON body.
-              Save is refused until the required and recommended checks pass.
+              must include URL, Authorization, cookies through Cookie or -b,
+              and the request JSON body. Save is refused until the required and
+              recommended checks pass.
             </p>
             <div
               class="mt-4 rounded-3xl border border-sky-300/20 bg-sky-300/[0.06] p-4"
@@ -3446,8 +3587,8 @@
                 >
                   <div class="font-black">Upload</div>
                   <div class="mt-1 text-sm text-slate-400">
-                    free/go/plus/pro 1. OCR, describe, and source-image edit
-                    uploads share this bucket.
+                    free/go/plus/pro 1. OCR, describe, chat-with-image, and
+                    source-image edit/composite uploads share this bucket.
                   </div>
                 </div>
                 <div
@@ -3736,7 +3877,8 @@
                 <p class="mt-2 text-sm text-slate-400">
                   Routes: `POST /v1/chatgpt/vision` and `POST
                   /v1/images/edits`. Vision can return plain OCR text or
-                  prompt-shaped JSON/bbox; edits return one image.
+                  prompt-shaped JSON/bbox; edits return one image. Source
+                  images use file_upload usage when ChatGPT reports it.
                 </p>
               </div>
               <div class="rounded-2xl border border-white/10 bg-black/20 p-4">
@@ -3959,7 +4101,7 @@
               title="What to check when it breaks"
             />
             <div class="mt-4 grid gap-3 md:grid-cols-2">
-              {#each [["401 unauthorized", "Bearer key does not match the running API server. Check the key in Launch or use the default local-dev-key."], ["missing=url,authorization,cookie", "The capture paste is incomplete. For cURL, paste the whole command including the ChatGPT URL, -H Authorization, -H Cookie, and --data-raw JSON."], ["request body must be JSON", "The copied local curl command lost a trailing backslash or Content-Type header. Copy the generated block again."], ["Chat hangs before any text", "Refresh token/prepare may be slow. The bridge now fails token refresh within 30 seconds instead of hanging for Deep Research timeout."], ["Account expired", "Open Accounts, click Update capture on that account, paste a fresh POST /backend-api/f/conversation request, then Save account."], ["Image is listed but file missing", "Library now hides and prunes stale DB records. A visible item must have exists=true and a real download link."], ["LAN client cannot download files", "Set Public base URL to the machine's LAN address, not 127.0.0.1, before starting the API server."]] as row (row[0])}
+              {#each [["401 unauthorized", "Bearer key does not match the running API server. Check the key in Launch or use the default local-dev-key."], ["missing=url,authorization,cookie", "The capture paste is incomplete. For cURL, paste the whole command including the ChatGPT URL, Authorization, Cookie or -b cookie jar text, and --data-raw JSON."], ["request body must be JSON", "The copied local curl command lost a trailing backslash or Content-Type header. Copy the generated block again."], ["Chat hangs before any text", "Refresh token/prepare may be slow. The bridge now fails token refresh within 30 seconds instead of hanging for Deep Research timeout."], ["Research did not cancel immediately", "Cancel is best effort. The bridge reads the Deep Research widget session from WSS, then sends the MCP stop call when the session id is known."], ["Account expired", "Open Accounts, click Update capture on that account, paste a fresh POST /backend-api/f/conversation request, then Save account."], ["Image is listed but file missing", "Library now hides and prunes stale DB records. A visible item must have exists=true and a real download link."], ["LAN client cannot download files", "Set Public base URL to the machine's LAN address, not 127.0.0.1, before starting the API server."]] as row (row[0])}
                 <div class="rounded-2xl border border-white/10 bg-black/20 p-4">
                   <div class="font-black text-slate-100">{row[0]}</div>
                   <p class="mt-2 text-sm text-slate-400">{row[1]}</p>
@@ -4219,7 +4361,7 @@
               >
                 <div>host <code>{serverHost}</code></div>
                 <div>port <code>{serverPort}</code></div>
-                <div>accounts <code>{serverAccounts}</code></div>
+                <div>accounts <code>{serverAccounts || "auto-discover"}</code></div>
                 <div>strategy <code>{serverStrategy}</code></div>
               </div>
             </div>
@@ -4490,8 +4632,9 @@
             <p>
               Paste a fresh request from the same account when cookies, token,
               sentinel, or conduit values expire. Headers/Payload text and full
-              Copy as cURL output are both accepted. The local account name
-              stays the same.
+              Copy as cURL output are both accepted. cURL captures must include
+              cookies through `Cookie:` or `-b`, Authorization, and `--data-raw`.
+              The local account name stays the same.
             </p>
           </div>
           <button onclick={closeCaptureModal}>Close</button>

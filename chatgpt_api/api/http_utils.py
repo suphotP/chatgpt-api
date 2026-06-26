@@ -74,3 +74,8 @@ def query_value(query: dict[str, list[str]], key: str, default: str = "") -> str
 def cancel_operation_id_from_path(path: str) -> str | None:
     match = re.fullmatch(r"/v1/chatgpt/operations/([^/]+)/cancel", path)
     return match.group(1) if match else None
+
+
+def operation_id_from_path(path: str) -> str | None:
+    match = re.fullmatch(r"/v1/chatgpt/operations/([^/]+)", path)
+    return match.group(1) if match else None

@@ -19,7 +19,7 @@ provider API.
 Start the API server from the repository root:
 
 ```sh
-chatgpt-api serve --account pro-main --host 127.0.0.1 --port 8000
+chatgpt-api serve --host 127.0.0.1 --port 8000
 ```
 
 Then start the app:

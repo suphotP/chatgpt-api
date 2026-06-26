@@ -9,9 +9,11 @@ ChatGPT Web bridge, while making limits and unsupported features visible.
 - The server exposes `/v1/chat/completions` and `/v1/models`.
 - opencode executes tools. This server only asks ChatGPT to return tool calls.
 - The server can use one ChatGPT account or a comma-separated account pool.
-- Multi-account routing supports `auto`, `sticky`, `failover`, `round-robin`,
-  `weighted`, and `quota-aware` strategy names. `quota-aware` currently behaves
-  like failover until live quota scoring is implemented.
+- Multi-account routing supports `auto`, `sticky`, `failover`, `random`,
+  `round-robin`, `weighted`, and `quota-aware` strategy names. Image-input,
+  image-generation, and Deep Research routes preflight reported feature usage
+  before sending the real request. `not_reported` is treated as unknown
+  capacity, not as blocked.
 - The recommended opencode model is `chatgpt-web/auto@optimized`.
 - Explicit model IDs such as `chatgpt-web/gpt-5-5@optimized` should surface
   model limit errors instead of hiding them.
@@ -75,9 +77,12 @@ Router strategies:
 - `sticky`: keep using the chosen account until it fails.
 - `failover`: use the chosen account first, then another eligible account after
   a model limit, auth error, rate limit, unsupported model, or empty response.
+- `random`: shuffle account order for each request while keeping failover
+  fallbacks if the first random account fails.
 - `round-robin`: rotate accounts evenly.
 - `weighted`: rotate by configured plan weight.
-- `quota-aware`: planned quota scoring mode. It currently keeps failover order.
+- `quota-aware`: keep configured account order as the base order, then let
+  request-specific usage preflight prefer accounts that still report capacity.
 
 Suggested starting weights:
 
@@ -107,7 +112,8 @@ Model choice should be explicit and explainable:
 ## Image Generation
 
 ChatGPT image generation is implemented in the provider transport and exposed
-through `/v1/images/generations` plus `chatgpt-api image`. It follows the current
+through `/v1/images/generations` plus `python3 -m chatgpt_api api image`.
+It follows the current
 ChatGPT Web flow: create an image turn, wait for the async image asset, fetch the
 download URL, then return URL or base64 data.
 
@@ -139,8 +145,8 @@ Inspect ~/Desktop/example.png and describe what needs changing.
 
 For text files, opencode should use read, grep, glob, or bash tools. For images,
 the provider can upload an input image when called explicitly through
-`chatgpt-api image --input-image`, but opencode attachment forwarding is not part
-of the current public contract.
+`python3 -m chatgpt_api api edit --input-image`, but opencode attachment
+forwarding is not part of the current public contract.
 
 ## Capture UX
 

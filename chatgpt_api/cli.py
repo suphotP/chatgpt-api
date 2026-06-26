@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import getpass
 import json
 import mimetypes
@@ -13,6 +14,8 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -236,7 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     account_add.add_argument(
         "--account",
         metavar="ACCOUNT_NAME",
-        help="Local account alias to create, such as pro-main. This is not the ChatGPT plan name.",
+        help="Local account alias to create, such as plus-main or work-pro. This is not the ChatGPT plan name.",
     )
     account_add.add_argument("--capture-file", type=Path, metavar="PATH")
     account_add.add_argument("--paste", action="store_true", help="Paste capture text interactively instead of reading a file")
@@ -248,7 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
     account_update.add_argument(
         "--account",
         metavar="ACCOUNT_NAME",
-        help="Local account alias to refresh, such as pro-main. This is not the ChatGPT plan name.",
+        help="Local account alias to refresh, such as plus-main or work-pro. This is not the ChatGPT plan name.",
     )
     account_update.add_argument("--capture-file", type=Path, metavar="PATH")
     account_update.add_argument("--paste", action="store_true", help="Paste capture text interactively instead of reading a file")
@@ -276,7 +279,7 @@ def build_parser() -> argparse.ArgumentParser:
     admin_save_capture.add_argument(
         "--account",
         metavar="ACCOUNT_NAME",
-        help="Local account alias to create or refresh, such as pro-main. This is not the ChatGPT plan name.",
+        help="Local account alias to create or refresh, such as plus-main or work-pro. This is not the ChatGPT plan name.",
     )
     admin_save_capture.add_argument("--capture-file", type=Path, metavar="PATH")
     admin_save_capture.add_argument("--paste", action="store_true", help="Paste capture text interactively instead of reading a file")
@@ -334,7 +337,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     admin_presets = admin_subparsers.add_parser("presets", help="Print launch presets for local, LAN, and Docker")
     admin_commands.append(admin_presets)
-    admin_presets.add_argument("--accounts", default="free-main,pro-main")
+    admin_presets.add_argument("--accounts", default="free,pro")
     admin_presets.add_argument("--api-key", default=os.environ.get("CHATGPT_API_KEY", "local-dev-key"))
     admin_presets.add_argument("--lan-host", default="0.0.0.0")
     admin_presets.add_argument("--lan-base-url", default="http://192.168.1.203:8000/v1")
@@ -345,6 +348,133 @@ def build_parser() -> argparse.ArgumentParser:
             continue
         admin_command.add_argument("--base-url", default=argparse.SUPPRESS)
         admin_command.add_argument("--api-key", default=argparse.SUPPRESS)
+
+    api = subparsers.add_parser("api", help="Call the running Bridge API with flexible automation-friendly flags")
+    api.add_argument("--base-url", default=_admin_base_url_default())
+    api.add_argument("--api-key", default=_admin_api_key_default())
+    api.add_argument("--timeout", type=float, default=120.0)
+    api_subparsers = api.add_subparsers(required=True)
+    api_commands: list[argparse.ArgumentParser] = []
+
+    api_health = api_subparsers.add_parser("health", help="Check /health on the running API")
+    api_commands.append(api_health)
+    api_health.add_argument("--json", action="store_true")
+    api_health.set_defaults(func=cmd_api_health)
+
+    api_status = api_subparsers.add_parser("status", help="Show routing, storage, and server status")
+    api_commands.append(api_status)
+    api_status.add_argument("--json", action="store_true")
+    api_status.set_defaults(func=cmd_admin_status)
+
+    api_capacity = api_subparsers.add_parser("capacity", help="Show strategy, routed accounts, quotas, and concurrency")
+    api_commands.append(api_capacity)
+    api_capacity.add_argument("--json", action="store_true")
+    api_capacity.set_defaults(func=cmd_admin_capacity)
+
+    api_usage = api_subparsers.add_parser("usage", help="Show live per-account usage and reset metadata")
+    api_commands.append(api_usage)
+    api_usage.add_argument("--json", action="store_true")
+    api_usage.set_defaults(func=cmd_admin_usage)
+
+    api_models = api_subparsers.add_parser("models", help="Show model aliases exposed by the running API")
+    api_commands.append(api_models)
+    api_models.add_argument("--json", action="store_true")
+    api_models.set_defaults(func=cmd_admin_models)
+
+    api_chat = api_subparsers.add_parser("chat", help="Send chat through the running API router/strategy")
+    api_commands.append(api_chat)
+    api_chat.add_argument("--message", "-m", required=True)
+    api_chat.add_argument("--system", default=None)
+    api_chat.add_argument("--model", default="auto")
+    api_chat.add_argument("--thinking-effort", default=None)
+    api_chat.add_argument("--agent-mode", choices=["optimized", "opencode"], default=None)
+    api_chat.add_argument("--temperature", type=float, default=None)
+    api_chat.add_argument("--max-tokens", type=int, default=None)
+    api_chat.add_argument("--metadata-json", default=None, help="Extra JSON object merged into request metadata")
+    api_chat.add_argument("--stream", action=argparse.BooleanOptionalAction, default=False)
+    api_chat.add_argument("--temporary-chat", action=argparse.BooleanOptionalAction, default=None)
+    api_chat.add_argument("--operation-id", default=None, help="Optional client-provided chatgpt operation id")
+    api_chat.add_argument("--output", type=Path, default=None, help="Write assistant text to a file")
+    api_chat.add_argument("--json", action="store_true")
+    _add_api_route_arguments(api_chat)
+    api_chat.set_defaults(func=cmd_api_chat)
+
+    api_image = api_subparsers.add_parser("image", help="Generate one image through the running API router/strategy")
+    api_commands.append(api_image)
+    api_image.add_argument("--prompt", "-p", required=True)
+    api_image.add_argument("--model", default="auto")
+    api_image.add_argument("--size", default=None)
+    api_image.add_argument("--quality", default=None)
+    api_image.add_argument("--style", default=None)
+    api_image.add_argument("--response-format", choices=["url", "b64_json"], default="url")
+    api_image.add_argument("--output-dir", default=None)
+    api_image.add_argument("--output-path", default=None)
+    api_image.add_argument("--operation-id", default=None)
+    api_image.add_argument("--json", action="store_true")
+    _add_api_route_arguments(api_image)
+    api_image.set_defaults(func=cmd_api_image)
+
+    api_edit = api_subparsers.add_parser("edit", help="Edit or composite source images through /v1/images/edits")
+    api_commands.append(api_edit)
+    api_edit.add_argument("--prompt", "-p", required=True)
+    api_edit.add_argument("--input-image", type=Path, action="append", default=[], required=True)
+    api_edit.add_argument("--aspect-ratio", choices=["auto", "1:1", "3:4", "9:16", "4:3", "16:9"], default="auto")
+    api_edit.add_argument("--model", default="auto")
+    api_edit.add_argument("--size", default=None)
+    api_edit.add_argument("--response-format", choices=["url", "b64_json"], default="url")
+    api_edit.add_argument("--output-dir", default=None)
+    api_edit.add_argument("--output-path", default=None)
+    api_edit.add_argument("--operation-id", default=None)
+    api_edit.add_argument("--json", action="store_true")
+    _add_api_route_arguments(api_edit)
+    api_edit.set_defaults(func=cmd_api_edit)
+
+    api_vision = api_subparsers.add_parser("vision", help="OCR, describe, or custom vision prompt through the running API")
+    api_commands.append(api_vision)
+    api_vision.add_argument("--input-image", type=Path, action="append", default=[], required=True)
+    api_vision.add_argument("--mode", choices=["ocr", "describe", "custom"], default="custom")
+    api_vision.add_argument("--prompt", "-p", default=None)
+    api_vision.add_argument("--model", default="auto")
+    api_vision.add_argument("--thinking-effort", default=None)
+    api_vision.add_argument("--temporary-chat", action=argparse.BooleanOptionalAction, default=True)
+    api_vision.add_argument("--output", type=Path, default=None, help="Write response text to a file")
+    api_vision.add_argument("--json", action="store_true")
+    _add_api_route_arguments(api_vision)
+    api_vision.set_defaults(func=cmd_api_vision)
+
+    api_research = api_subparsers.add_parser("research", help="Run Deep Research and save/download the markdown report")
+    api_commands.append(api_research)
+    api_research.add_argument("--prompt", "-p", required=True)
+    api_research.add_argument("--model", default="chatgpt-deep-research")
+    api_research.add_argument("--output-dir", default=None)
+    api_research.add_argument("--output-path", default=None)
+    api_research.add_argument("--operation-id", default=None, help="Client-provided operation id; generated when omitted")
+    api_research.add_argument("--json", action="store_true")
+    _add_api_route_arguments(api_research)
+    api_research.set_defaults(func=cmd_api_research)
+
+    api_operation = api_subparsers.add_parser("operation", help="Inspect a running or recently completed API operation")
+    api_commands.append(api_operation)
+    api_operation.add_argument("--operation-id", required=True)
+    api_operation.add_argument("--json", action="store_true")
+    api_operation.set_defaults(func=cmd_api_operation)
+
+    api_cancel = api_subparsers.add_parser("cancel", help="Cancel long chat, image, or research work by operation id")
+    api_commands.append(api_cancel)
+    api_cancel.add_argument("--operation-id", required=True)
+    api_cancel.add_argument("--json", action="store_true")
+    api_cancel.set_defaults(func=cmd_api_cancel)
+
+    api_artifacts = api_subparsers.add_parser("artifacts", help="List saved images and research reports")
+    api_commands.append(api_artifacts)
+    api_artifacts.add_argument("--limit", type=int, default=100)
+    api_artifacts.add_argument("--json", action="store_true")
+    api_artifacts.set_defaults(func=cmd_admin_artifacts)
+
+    for api_command in api_commands:
+        api_command.add_argument("--base-url", default=argparse.SUPPRESS)
+        api_command.add_argument("--api-key", default=argparse.SUPPRESS)
+        api_command.add_argument("--timeout", type=float, default=argparse.SUPPRESS)
 
     chat = subparsers.add_parser("chat", help="Send a chat message")
     chat.add_argument("--model", default=None)
@@ -419,8 +549,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     server_command = server_subparsers.add_parser("command", help="Print a copy-paste server start command")
     server_command.add_argument("--preset", choices=["local", "lan", "docker"], default="local")
-    server_command.add_argument("--accounts", default=os.environ.get("CHATGPT_ACCOUNTS", "free-main,pro-main"))
+    server_command.add_argument(
+        "--accounts",
+        default=os.environ.get("CHATGPT_ACCOUNTS", ""),
+        help="Optional comma-separated local account aliases. Omit to auto-discover secrets/accounts/*.",
+    )
     server_command.add_argument("--api-key", default=os.environ.get("CHATGPT_API_KEY", "local-dev-key"))
+    server_command.add_argument("--host", default=None, help="Override generated server host for local/lan presets")
+    server_command.add_argument("--port", type=int, default=8000, help="Override generated server port")
+    server_command.add_argument("--public-base-url", default=None, help="Override generated public /v1 base URL")
+    server_command.add_argument("--account-strategy", default="failover", choices=["auto", "sticky", "failover", "round-robin", "weighted", "quota-aware", "random"])
     server_command.add_argument("--lan-base-url", default=os.environ.get("CHATGPT_PUBLIC_BASE_URL", "http://192.168.1.203:8000/v1"))
     server_command.set_defaults(func=cmd_server_command)
 
@@ -437,16 +575,16 @@ def _add_serve_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Prompt for server settings before launch instead of relying only on flags/env vars.",
     )
-    parser.add_argument("--account", default=os.environ.get("CHATGPT_ACCOUNT", "free"))
+    parser.add_argument("--account", default=os.environ.get("CHATGPT_ACCOUNT", ""))
     parser.add_argument(
         "--accounts",
         default=os.environ.get("CHATGPT_ACCOUNTS", ""),
-        help="Comma-separated local account aliases for multi-account failover/routing, for example free-main,pro-main.",
+        help="Comma-separated local account aliases for routing. Omit to auto-discover captures under secrets/accounts/*.",
     )
     parser.add_argument(
         "--account-strategy",
         default=os.environ.get("CHATGPT_ACCOUNT_STRATEGY", "auto"),
-        help="Account routing strategy: auto, sticky, failover, round-robin, weighted, quota-aware",
+        help="Account routing strategy: auto, sticky, failover, random, round-robin, weighted, quota-aware",
     )
     parser.add_argument("--accounts-dir", type=Path, default=_accounts_dir_default())
     parser.add_argument(
@@ -540,6 +678,27 @@ def _add_serve_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_api_route_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--account",
+        default=None,
+        metavar="ACCOUNT_NAME",
+        help="Route this one API request to a single local account alias, for example free, go, plus-main, or work-pro.",
+    )
+    parser.add_argument(
+        "--accounts",
+        default=None,
+        metavar="ACCOUNT_A,ACCOUNT_B",
+        help="Route this one API request across a temporary comma-separated account pool.",
+    )
+    parser.add_argument(
+        "--account-strategy",
+        default=None,
+        choices=["auto", "sticky", "failover", "random", "round-robin", "weighted", "quota-aware"],
+        help="Temporary routing strategy for this one request; omitted means use the running server strategy.",
+    )
+
+
 def _admin_base_url_default() -> str:
     return os.environ.get("CHATGPT_ADMIN_BASE_URL") or os.environ.get("CHATGPT_BASE_URL") or "http://127.0.0.1:8000/v1"
 
@@ -604,7 +763,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         "accounts_dir": str(accounts_dir) if accounts_dir else None,
         "checks": checks,
         "next": {
-            "start_server": "python3 -m chatgpt_api server start --accounts <account-names> --api-key <api-key>",
+            "start_server": "python3 -m chatgpt_api server start --api-key <api-key>",
             "check_capacity": "python3 -m chatgpt_api admin capacity --base-url http://127.0.0.1:8000/v1 --api-key <api-key>",
             "docker": "docker compose up --build",
         },
@@ -622,8 +781,8 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"{_status_word(bool(check['ok'])):<7} {check['name']:<17} {check.get('detail') or '-'}")
     print()
     print("next:")
-    print("  python3 -m chatgpt_api server start --accounts <account-names> --api-key local-dev-key")
-    print("  example account aliases: free-main,pro-main")
+    print("  python3 -m chatgpt_api server start --api-key local-dev-key")
+    print("  optional: add --accounts free,go,plus,pro to pin a clean route pool")
     print("  python3 -m chatgpt_api admin capacity --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key")
     print("  docker compose up --build")
     return 0 if payload["ok"] else 1
@@ -637,7 +796,7 @@ def _validate_account_name(value: str) -> str:
     if not ACCOUNT_NAME_RE.fullmatch(account):
         raise ProviderError(
             "account name must be an ASCII slug: English letters, numbers, dash, or underscore; "
-            "examples: free-main, pro-main, free_2"
+            "examples: free, go, plus-main, work-pro, free_2"
         )
     return account
 
@@ -704,7 +863,7 @@ def _suggest_account_alias(profiles: list[str]) -> str:
 
 def _prompt_new_account_alias(profiles: list[str]) -> str | None:
     print("Alias rules: English letters, numbers, dash, or underscore only.")
-    print("Examples: free-main, pro-main, work-pro, free_2")
+    print("Examples: free, go, plus-main, work-pro, free_2")
     print("Type `back` to cancel.")
     default = _suggest_account_alias(profiles)
     while True:
@@ -729,7 +888,7 @@ def _prompt_accounts_csv(label: str, *, default: str, profiles: list[str] | None
         print("available local account aliases:")
         for index, name in enumerate(profiles, start=1):
             print(f"  {index}. {name}")
-        print("Use comma-separated aliases or numbers, for example 1,2 or free-main,pro-main.")
+        print("Use comma-separated aliases or numbers, for example 1,2 or free,go,plus-main,work-pro.")
     while True:
         value = _prompt_text(label, default=default).strip()
         if not value:
@@ -805,8 +964,8 @@ def _prompt_account_name_or_all(*, default: str = "all") -> str:
             print(exc)
 
 
-def _prompt_capture_text(*, default_mode: str = "paste") -> str:
-    mode = _prompt_choice("capture source", ["paste", "file"], default=default_mode)
+def _prompt_capture_text(*, default_mode: str = "paste", force_mode: str | None = None) -> str:
+    mode = force_mode or _prompt_choice("capture source", ["paste", "file"], default=default_mode)
     if mode == "file":
         while True:
             path_text = _prompt_text("capture file path")
@@ -861,11 +1020,16 @@ async def cmd_menu(args: argparse.Namespace) -> int:
 
 
 def _print_control_menu(args: argparse.Namespace) -> None:
+    width = _terminal_width()
     print()
-    print(_headline("ChatGPT API Control Center"))
-    print(f"API        {_mono(args.base_url)}")
-    print(f"Bearer     {'set' if args.api_key else 'not set'}")
-    print(f"Shortcut   {_mono('python3 -m chatgpt_api <command>')} works even when {_mono('chatgpt-api')} is not on PATH")
+    print(_color("+" + "-" * (width - 2) + "+", "2"))
+    title = " ChatGPT API Control Center "
+    print(_color("|", "2") + _headline(title).ljust(width - 2)[: width - 2] + _color("|", "2"))
+    print(_color("+" + "-" * (width - 2) + "+", "2"))
+    print(f"  API       {_mono(args.base_url)}")
+    print(f"  Bearer    {'set' if args.api_key else 'not set'}")
+    print(f"  CLI       {_mono('python3 -m chatgpt_api api <command>')}  (runs through server routing)")
+    print(f"  Debug     {_mono('python3 -m chatgpt_api chat|image|vision')}  (direct account probe)")
     print()
     _print_menu_group(
         "Observe",
@@ -901,9 +1065,9 @@ def _print_control_menu(args: argparse.Namespace) -> None:
 
 
 def _print_menu_group(title: str, rows: list[tuple[str, str, str]]) -> None:
-    print(_color(title.upper(), "1;34"))
+    print(_color(f"[ {title.upper()} ]", "1;34"))
     for number, label, description in rows:
-        print(f"  {number:>2}. {label:<18} {description}")
+        print(f"  {number:>2}  {label:<18} {description}")
     print()
 
 
@@ -952,7 +1116,7 @@ async def _run_menu_action(args: argparse.Namespace, choice: str) -> int:
     if choice == "15":
         return await cmd_admin_presets(
             argparse.Namespace(
-                accounts=os.environ.get("CHATGPT_ACCOUNTS", "free-main,pro-main"),
+                accounts=os.environ.get("CHATGPT_ACCOUNTS", ""),
                 api_key=args.api_key,
                 lan_host="0.0.0.0",
                 lan_base_url=os.environ.get("CHATGPT_PUBLIC_BASE_URL", "http://192.168.1.203:8000/v1"),
@@ -964,7 +1128,7 @@ async def _run_menu_action(args: argparse.Namespace, choice: str) -> int:
 async def _menu_save_account_capture(args: argparse.Namespace, *, action: str) -> int:
     profiles = await _admin_account_aliases(args)
     print(_headline("Account Capture Wizard"))
-    print("Use a local alias such as free-main, pro-main, work-pro, or test-free.")
+    print("Use a local alias such as free, go, plus-main, work-pro, or test-free.")
     print("The capture is inspected before save, then live-verified unless you use the non-interactive flags.")
     print()
     if action == "add":
@@ -1016,23 +1180,48 @@ def _press_enter() -> None:
 
 
 async def cmd_server_command(args: argparse.Namespace) -> int:
+    accounts_fragment = _accounts_flag_fragment(args.accounts)
     if args.preset == "docker":
+        port = int(args.port or 8000)
         print("docker compose up --build")
-        print("docker run --rm -p 8000:8000 --env-file .env -v \"$PWD/secrets/accounts:/data/secrets/accounts\" -v \"$PWD/outputs:/data/outputs\" chatgpt-api:local")
-        return 0
-    if args.preset == "lan":
         print(
-            "CHATGPT_API_KEY={key} python3 -m chatgpt_api server start "
-            "--accounts {accounts} --account-strategy failover --host 0.0.0.0 --port 8000 "
-            "--public-base-url {base}"
-            .format(key=args.api_key, accounts=args.accounts, base=args.lan_base_url)
+            f"docker run --rm -p {port}:8000 --env-file .env "
+            "-v \"$PWD/secrets/accounts:/data/secrets/accounts\" "
+            "-v \"$PWD/outputs:/data/outputs\" chatgpt-api:local"
         )
         return 0
+    if args.preset == "lan":
+        host = args.host or "0.0.0.0"
+        public_base_url = args.public_base_url or args.lan_base_url
+        print(
+            "CHATGPT_API_KEY={key} python3 -m chatgpt_api server start "
+            "{accounts}--account-strategy {strategy} --host {host} --port {port} "
+            "--public-base-url {base}"
+            .format(
+                key=args.api_key,
+                accounts=accounts_fragment,
+                strategy=args.account_strategy,
+                host=host,
+                port=int(args.port or 8000),
+                base=public_base_url,
+            )
+        )
+        return 0
+    host = args.host or "127.0.0.1"
+    port = int(args.port or 8000)
+    public_base_url = args.public_base_url or f"http://{host}:{port}/v1"
     print(
         "CHATGPT_API_KEY={key} python3 -m chatgpt_api server start "
-        "--accounts {accounts} --account-strategy failover --host 127.0.0.1 --port 8000 "
-        "--public-base-url http://127.0.0.1:8000/v1"
-        .format(key=args.api_key, accounts=args.accounts)
+        "{accounts}--account-strategy {strategy} --host {host} --port {port} "
+        "--public-base-url {base}"
+        .format(
+            key=args.api_key,
+            accounts=accounts_fragment,
+            strategy=args.account_strategy,
+            host=host,
+            port=port,
+            base=public_base_url,
+        )
     )
     return 0
 
@@ -1460,7 +1649,9 @@ async def _save_capture_text_with_verification(args: argparse.Namespace, account
                 }
             )
         else:
+            print(_headline("Account Capture Rejected"))
             print("saved=false")
+            print("nothing_written=true")
             print("phase=inspect")
             print(f"account={account}")
             print(f"failed={_csv_or_dash(failed_checks)}")
@@ -1492,6 +1683,7 @@ async def _save_capture_text_with_verification(args: argparse.Namespace, account
         )
         return 0 if verify_ok else 2
     inspection = payload.get("inspection") if isinstance(payload.get("inspection"), dict) else payload
+    print(_headline("Account Capture Saved"))
     print("saved=true")
     print(f"account={account}")
     print(f"plan={inspection.get('plan_type') or inspection.get('plan_bucket') or '-'}")
@@ -1500,8 +1692,22 @@ async def _save_capture_text_with_verification(args: argparse.Namespace, account
     if verify_payload is not None:
         print(f"live_verify={'ok' if verify_ok else 'failed'}")
         for entry in verify_payload.get("accounts", []):
-            if isinstance(entry, dict) and entry.get("account") == account and not entry.get("ok"):
+            if not isinstance(entry, dict) or entry.get("account") != account:
+                continue
+            print(f"default_model={entry.get('default_model_slug') or '-'}")
+            features = entry.get("features") if isinstance(entry.get("features"), dict) else {}
+            for feature_key, label in (("deep_research", "research"), ("image_gen", "image"), ("file_upload", "upload")):
+                feature = features.get(feature_key) if isinstance(features.get(feature_key), dict) else {}
+                remaining = feature.get("remaining") if isinstance(feature, dict) else None
+                reset_after = (feature.get("reset_after") or feature.get("resets_after")) if isinstance(feature, dict) else None
+                print(f"{label}_remaining={remaining if remaining is not None else '-'}")
+                if reset_after:
+                    print(f"{label}_reset={reset_after}")
+            if not entry.get("ok"):
                 print(f"live_error={entry.get('error') or entry.get('warning') or entry.get('status') or '-'}")
+    print("next:")
+    print(f"  python3 -m chatgpt_api api chat --message 'Say hello' --account {account} --base-url {args.base_url} --api-key {args.api_key}")
+    print(f"  python3 -m chatgpt_api api capacity --base-url {args.base_url} --api-key {args.api_key}")
     return 0 if verify_ok else 2
 
 
@@ -1512,7 +1718,7 @@ def _account_name_from_args(args: argparse.Namespace) -> str:
     if sys.stdin.isatty() and not getattr(args, "json", False):
         return _prompt_account_name()
     raise ProviderError(
-        "pass --account <account-name>; account names are local aliases like free-main, pro-main, or work-pro, not plan selectors"
+        "pass --account <account-name>; account names are local aliases like free, go, plus-main, or work-pro, not plan selectors"
     )
 
 
@@ -1520,7 +1726,9 @@ def _capture_text_from_args(args: argparse.Namespace) -> str:
     capture_file = getattr(args, "capture_file", None)
     if capture_file is not None:
         return Path(capture_file).expanduser().read_text(encoding="utf-8")
-    if getattr(args, "paste", False) or (sys.stdin.isatty() and not getattr(args, "json", False)):
+    if getattr(args, "paste", False):
+        return _prompt_capture_text(force_mode="paste")
+    if sys.stdin.isatty() and not getattr(args, "json", False):
         return _prompt_capture_text()
     raise ProviderError("pass --capture-file <path> or run interactively with --paste")
 
@@ -1664,39 +1872,707 @@ async def cmd_admin_test_image(args: argparse.Namespace) -> int:
 
 
 async def cmd_admin_presets(args: argparse.Namespace) -> int:
+    accounts_fragment = _accounts_flag_fragment(args.accounts)
+    accounts_env = ",".join(_split_account_csv(args.accounts))
     print("Local single-machine dev:")
     print(
         "  "
         "CHATGPT_API_KEY={key} python3 -m chatgpt_api serve "
-        "--accounts {accounts} --account-strategy failover --host 127.0.0.1 --port 8000 "
+        "{accounts}--account-strategy failover --host 127.0.0.1 --port 8000 "
         "--public-base-url http://127.0.0.1:8000/v1"
-        .format(key=args.api_key, accounts=args.accounts)
+        .format(key=args.api_key, accounts=accounts_fragment)
     )
     print("\nLAN API server:")
     print(
         "  "
         "CHATGPT_API_KEY={key} python3 -m chatgpt_api serve "
-        "--accounts {accounts} --account-strategy failover --host {host} --port 8000 "
+        "{accounts}--account-strategy failover --host {host} --port 8000 "
         "--public-base-url {base}"
-        .format(key=args.api_key, accounts=args.accounts, host=args.lan_host, base=args.lan_base_url)
+        .format(key=args.api_key, accounts=accounts_fragment, host=args.lan_host, base=args.lan_base_url)
     )
     print("\nDocker-style environment:")
+    account_env = f"CHATGPT_ACCOUNTS={accounts_env} " if accounts_env else ""
     print(
         "  "
-        "CHATGPT_API_KEY={key} CHATGPT_ACCOUNTS={accounts} CHATGPT_API_HOST=0.0.0.0 "
+        "CHATGPT_API_KEY={key} {accounts}CHATGPT_API_HOST=0.0.0.0 "
         "CHATGPT_API_PORT=8000 CHATGPT_PUBLIC_BASE_URL={base} "
         "CHATGPT_CHAT_CONCURRENCY=free=1,go=2,plus=3,pro=4 "
         "CHATGPT_UPLOAD_CONCURRENCY=free=1,go=1,plus=1,pro=1 "
         "CHATGPT_IMAGE_CONCURRENCY=free=1,go=1,plus=2,pro=3 "
         "CHATGPT_RESEARCH_CONCURRENCY=free=1,go=1,plus=2,pro=2 "
         "python3 -m chatgpt_api serve"
-        .format(key=args.api_key, accounts=args.accounts, base=args.lan_base_url)
+        .format(key=args.api_key, accounts=account_env, base=args.lan_base_url)
     )
+    if not accounts_env:
+        print("  # CHATGPT_ACCOUNTS is optional; omitted means auto-discover every saved capture under secrets/accounts/*.")
     print("\nManage while running:")
     print("  python3 -m chatgpt_api admin status --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key")
     print("  python3 -m chatgpt_api admin set-limits --upload pro=1 --image pro=3 --research pro=2 --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key")
     print("  python3 -m chatgpt_api admin opencode inject --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key")
     return 0
+
+
+async def cmd_api_health(args: argparse.Namespace) -> int:
+    payload = await _probe_json(_health_url(args.base_url), args.api_key, timeout=_request_timeout(args))
+    if args.json:
+        _print_json(payload)
+        return 0 if payload.get("ok") else 1
+    print(_headline("Bridge Health"))
+    print(f"base_url={args.base_url}")
+    print(f"ok={'yes' if payload.get('ok') else 'no'}")
+    if payload.get("account"):
+        print(f"primary_account={payload.get('account')}")
+    if payload.get("accounts"):
+        print(f"accounts={_csv_or_dash([str(item) for item in payload.get('accounts') or []])}")
+    if payload.get("detail"):
+        print(f"detail={payload.get('detail')}")
+    return 0 if payload.get("ok") else 1
+
+
+async def cmd_api_chat(args: argparse.Namespace) -> int:
+    metadata = _json_object_arg(args.metadata_json, "--metadata-json")
+    if args.temporary_chat is not None:
+        metadata["chatgpt_temporary_chat"] = args.temporary_chat
+    if args.agent_mode:
+        metadata["agent_mode"] = args.agent_mode
+    if args.operation_id:
+        metadata["chatgpt_operation_id"] = args.operation_id
+
+    messages: list[dict[str, str]] = []
+    if args.system:
+        messages.append({"role": "system", "content": args.system})
+    messages.append({"role": "user", "content": args.message})
+    body: dict[str, object] = {"model": args.model, "messages": messages, "stream": bool(args.stream)}
+    if metadata:
+        body["metadata"] = metadata
+    if args.thinking_effort:
+        body["thinking_effort"] = args.thinking_effort
+    if args.temperature is not None:
+        body["temperature"] = args.temperature
+    if args.max_tokens is not None:
+        body["max_tokens"] = args.max_tokens
+    _apply_api_route_options(body, args)
+
+    if args.stream:
+        text = await _api_stream_chat(args, body)
+        if args.output:
+            _write_text_output(args.output, text)
+        return 0
+
+    payload = await _api_request_json(args, "POST", "/chat/completions", body)
+    if args.json:
+        _print_json(payload)
+        return 0
+    text = _completion_text(payload)
+    if args.output:
+        _write_text_output(args.output, text)
+    print(_headline("Chat Response"))
+    _print_response_context(payload)
+    print()
+    print(text)
+    return 0
+
+
+async def cmd_api_image(args: argparse.Namespace) -> int:
+    metadata: dict[str, object] = {}
+    if args.operation_id:
+        metadata["chatgpt_operation_id"] = args.operation_id
+    body = _compact_dict(
+        {
+            "model": args.model,
+            "prompt": args.prompt,
+            "size": args.size,
+            "quality": args.quality,
+            "style": args.style,
+            "response_format": args.response_format,
+            "metadata": metadata or None,
+        }
+    )
+    _apply_api_route_options(body, args)
+    payload = await _api_request_json(args, "POST", "/images/generations", body)
+    local_paths = await _save_api_image_outputs(args, payload)
+    if local_paths:
+        payload["local_paths"] = [str(path) for path in local_paths]
+    if args.json:
+        _print_json(payload)
+        return 0
+    _print_image_payload(payload, "Image Result")
+    _print_local_paths(local_paths)
+    return 0
+
+
+async def cmd_api_edit(args: argparse.Namespace) -> int:
+    metadata: dict[str, object] = {}
+    if args.operation_id:
+        metadata["chatgpt_operation_id"] = args.operation_id
+    body = _compact_dict(
+        {
+            "model": args.model,
+            "prompt": args.prompt,
+            "input_images": [_image_reference_for_api(path) for path in args.input_image],
+            "aspect_ratio": args.aspect_ratio,
+            "size": args.size,
+            "response_format": args.response_format,
+            "metadata": metadata or None,
+        }
+    )
+    _apply_api_route_options(body, args)
+    payload = await _api_request_json(args, "POST", "/images/edits", body)
+    local_paths = await _save_api_image_outputs(args, payload)
+    if local_paths:
+        payload["local_paths"] = [str(path) for path in local_paths]
+    if args.json:
+        _print_json(payload)
+        return 0
+    _print_image_payload(payload, "Image Edit Result")
+    _print_local_paths(local_paths)
+    warnings = payload.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        print("warnings:")
+        for warning in warnings:
+            print(f"  - {warning}")
+    return 0
+
+
+async def cmd_api_vision(args: argparse.Namespace) -> int:
+    body = _compact_dict(
+        {
+            "model": args.model,
+            "mode": args.mode,
+            "prompt": args.prompt,
+            "input_images": [_image_reference_for_api(path) for path in args.input_image],
+            "thinking_effort": args.thinking_effort,
+            "metadata": {"chatgpt_temporary_chat": args.temporary_chat},
+        }
+    )
+    _apply_api_route_options(body, args)
+    payload = await _api_request_json(args, "POST", "/chatgpt/vision", body)
+    if args.json:
+        _print_json(payload)
+        return 0
+    text = str(payload.get("text") or _completion_text(payload))
+    if args.output:
+        _write_text_output(args.output, text)
+    print(_headline("Vision Response"))
+    _print_response_context(payload)
+    print(f"mode={payload.get('mode') or args.mode}")
+    print(f"input_images={payload.get('input_image_count') if payload.get('input_image_count') is not None else len(args.input_image)}")
+    print()
+    print(text)
+    return 0
+
+
+async def cmd_api_research(args: argparse.Namespace) -> int:
+    operation_id = args.operation_id or f"chatgptop_{uuid.uuid4().hex}"
+    metadata = _compact_dict(
+        {
+            "deep_research": True,
+            "chatgpt_operation_id": operation_id,
+        }
+    )
+    body = _compact_dict(
+        {
+            "model": args.model,
+            "messages": [{"role": "user", "content": args.prompt}],
+            "stream": False,
+            "deep_research": True,
+            "chatgpt_operation_id": operation_id,
+            "metadata": metadata,
+        }
+    )
+    _apply_api_route_options(body, args)
+    if not args.json:
+        print(_headline("Deep Research"))
+        print(f"operation_id={operation_id}")
+        print(
+            "status_command="
+            f"python3 -m chatgpt_api api operation --operation-id {operation_id} "
+            f"--base-url {args.base_url} --api-key {args.api_key}"
+        )
+        print(
+            "cancel_command="
+            f"python3 -m chatgpt_api api cancel --operation-id {operation_id} "
+            f"--base-url {args.base_url} --api-key {args.api_key}"
+        )
+        print("cancel_note=For Deep Research, wait until operation status shows deep_research_ready=yes before expecting MCP stop to be immediate.")
+        print("waiting=true")
+        print()
+    try:
+        payload = await _api_request_json(args, "POST", "/chat/completions", body)
+    except ProviderError as exc:
+        if _provider_error_is_cancelled(exc):
+            if args.json:
+                _print_json({"status": "cancelled", "operation_id": operation_id})
+            else:
+                print(_headline("Research Cancelled"))
+                print(f"operation_id={operation_id}")
+                print("status=cancelled")
+                print("note=Deep Research stop was accepted; no report was produced.")
+            return 130
+        raise
+    local_report_path = await _save_api_research_output(args, payload)
+    if local_report_path:
+        payload["local_report_path"] = str(local_report_path)
+    if args.json:
+        _print_json(payload)
+        return 0
+    print(_headline("Research Complete"))
+    _print_response_context(payload)
+    print(f"operation_id={payload.get('chatgpt_operation_id') or operation_id}")
+    report_path = payload.get("chatgpt_research_report_path")
+    download_url = payload.get("chatgpt_research_report_download_url")
+    if report_path:
+        print(f"report_path={report_path}")
+    if download_url:
+        print(f"download_url={download_url}")
+    if local_report_path:
+        print(f"local_report_path={local_report_path}")
+    print()
+    print(_completion_text(payload))
+    return 0
+
+
+async def cmd_api_operation(args: argparse.Namespace) -> int:
+    payload = await _api_request_json(args, "GET", f"/chatgpt/operations/{args.operation_id}", None)
+    if args.json:
+        _print_json(payload)
+        return 0
+    operation = payload.get("operation") if isinstance(payload.get("operation"), dict) else {}
+    print(_headline("Operation Status"))
+    print(f"operation_id={operation.get('id') or args.operation_id}")
+    print(f"kind={operation.get('kind') or '-'}")
+    print(f"account={operation.get('account') or '-'}")
+    print(f"provider_selected={'yes' if operation.get('provider_selected') else 'no'}")
+    print(f"conversation_id={operation.get('conversation_id') or '-'}")
+    if operation.get("kind") == "research":
+        print(f"deep_research_ready={'yes' if operation.get('deep_research_ready') else 'no'}")
+        print(f"deep_research_message_id={operation.get('deep_research_message_id') or '-'}")
+        print(f"deep_research_session_id={operation.get('deep_research_session_id') or '-'}")
+    if operation.get("pending_reason"):
+        print(f"pending_reason={operation.get('pending_reason')}")
+    print(f"cancel_requested={'yes' if operation.get('cancel_requested') else 'no'}")
+    print(f"completed={'yes' if operation.get('completed') else 'no'}")
+    if operation.get("last_cancel_error"):
+        print(f"last_cancel_error={operation.get('last_cancel_error')}")
+    elif operation.get("last_cancel_result"):
+        print(f"last_cancel_result={json.dumps(operation.get('last_cancel_result'), ensure_ascii=False, sort_keys=True)}")
+    return 0
+
+
+async def cmd_api_cancel(args: argparse.Namespace) -> int:
+    payload = await _api_request_json(args, "POST", f"/chatgpt/operations/{args.operation_id}/cancel", {})
+    if args.json:
+        _print_json(payload)
+        return 0
+    operation = payload.get("operation") if isinstance(payload.get("operation"), dict) else {}
+    print(_headline("Cancel Result"))
+    print(f"operation_id={operation.get('id') or operation.get('operation_id') or args.operation_id}")
+    print(f"kind={operation.get('kind') or '-'}")
+    if operation.get("kind") == "research":
+        print(f"deep_research_ready={'yes' if operation.get('deep_research_ready') else 'no'}")
+        if operation.get("pending_reason"):
+            print(f"pending_reason={operation.get('pending_reason')}")
+    print(f"cancel_requested={'yes' if operation.get('cancel_requested') else 'no'}")
+    print(f"completed={'yes' if operation.get('completed') else 'no'}")
+    if operation.get("last_cancel_error"):
+        print(f"error={operation.get('last_cancel_error')}")
+    elif operation.get("last_cancel_result"):
+        print(f"provider_stop={json.dumps(operation.get('last_cancel_result'), ensure_ascii=False, sort_keys=True)}")
+    return 0
+
+
+def _request_timeout(args: argparse.Namespace) -> float:
+    try:
+        return max(1.0, float(getattr(args, "timeout", 120.0)))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _json_object_arg(raw: str | None, label: str) -> dict[str, object]:
+    if raw is None or not raw.strip():
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"{label} must be a JSON object") from exc
+    if not isinstance(value, dict):
+        raise ProviderError(f"{label} must be a JSON object")
+    return dict(value)
+
+
+def _compact_dict(value: dict[str, object | None]) -> dict[str, object]:
+    return {key: item for key, item in value.items() if item is not None and item != {}}
+
+
+def _str_or_none(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _split_account_csv(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(_validate_account_name(part.strip()) for part in value.split(",") if part.strip())
+
+
+def _discover_saved_accounts(accounts_dir: Path | None) -> tuple[str, ...]:
+    return tuple(profile.name for profile in list_account_profiles(accounts_dir) if profile.exists)
+
+
+def _server_accounts_from_args(args: argparse.Namespace) -> tuple[str, ...]:
+    explicit = _split_account_csv(getattr(args, "accounts", None))
+    if explicit:
+        return explicit
+    discovered = _discover_saved_accounts(getattr(args, "accounts_dir", None))
+    if discovered:
+        return discovered
+    account = getattr(args, "account", None)
+    if isinstance(account, str) and account.strip():
+        return (_validate_account_name(account.strip()),)
+    return ()
+
+
+def _primary_account_from_args(args: argparse.Namespace, accounts: tuple[str, ...]) -> str:
+    account = getattr(args, "account", None)
+    if isinstance(account, str) and account.strip():
+        return _validate_account_name(account.strip())
+    if accounts:
+        return accounts[0]
+    return "free"
+
+
+def _accounts_flag_fragment(accounts: str | None) -> str:
+    selected = _split_account_csv(accounts)
+    if not selected:
+        return ""
+    return f"--accounts {','.join(selected)} "
+
+
+def _api_route_options(args: argparse.Namespace) -> dict[str, object]:
+    account = getattr(args, "account", None)
+    accounts = getattr(args, "accounts", None)
+    if account and accounts:
+        raise ProviderError("use either --account or --accounts, not both")
+    options: dict[str, object] = {}
+    if isinstance(account, str) and account.strip():
+        options["chatgpt_account"] = _validate_account_name(account.strip())
+    if isinstance(accounts, str) and accounts.strip():
+        selected = [_validate_account_name(part.strip()) for part in accounts.split(",") if part.strip()]
+        if not selected:
+            raise ProviderError("--accounts requires at least one account alias")
+        options["chatgpt_accounts"] = selected
+    strategy = getattr(args, "account_strategy", None)
+    if isinstance(strategy, str) and strategy.strip():
+        options["chatgpt_account_strategy"] = strategy.strip()
+    return options
+
+
+def _apply_api_route_options(body: dict[str, object], args: argparse.Namespace) -> None:
+    body.update(_api_route_options(args))
+
+
+def _provider_error_is_cancelled(exc: ProviderError) -> bool:
+    message = str(exc).lower()
+    return "cancelled" in message or "canceled" in message or "chatgpt_operation_cancelled" in message
+
+
+async def _api_request_json(
+    args: argparse.Namespace,
+    method: str,
+    path: str,
+    body: dict[str, object] | None = None,
+) -> dict[str, object]:
+    text = await _api_request_text(args, method, path, body)
+    try:
+        payload = json.loads(text) if text else {}
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"API returned non-JSON response: {text[:300]}") from exc
+    if not isinstance(payload, dict):
+        raise ProviderError("API returned an unexpected JSON payload")
+    return payload
+
+
+async def _api_request_text(
+    args: argparse.Namespace,
+    method: str,
+    path: str,
+    body: dict[str, object] | None = None,
+) -> str:
+    url = _admin_url(args.base_url, path)
+    headers: dict[str, str] = {}
+    if args.api_key:
+        headers["Authorization"] = f"Bearer {args.api_key}"
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    async with httpx.AsyncClient(timeout=_request_timeout(args), follow_redirects=True) as client:
+        response = await client.request(method, url, headers=headers, json=body if body is not None else None)
+    text = response.text
+    if response.status_code >= 400:
+        message = text
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                error = payload.get("error")
+                if isinstance(error, dict) and error.get("message"):
+                    message = str(error["message"])
+        except Exception:
+            pass
+        raise ProviderError(f"API {method} {path} failed: HTTP {response.status_code}: {message}")
+    return text
+
+
+async def _api_stream_chat(args: argparse.Namespace, body: dict[str, object]) -> str:
+    url = _admin_url(args.base_url, "/chat/completions")
+    headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
+    if args.api_key:
+        headers["Authorization"] = f"Bearer {args.api_key}"
+    text_parts: list[str] = []
+    async with httpx.AsyncClient(timeout=_request_timeout(args), follow_redirects=True) as client:
+        async with client.stream("POST", url, headers=headers, json=body) as response:
+            if response.status_code >= 400:
+                body_text = await response.aread()
+                message = body_text.decode("utf-8", errors="replace")
+                raise ProviderError(f"API POST /chat/completions failed: HTTP {response.status_code}: {message[:500]}")
+            operation_id = response.headers.get("X-ChatGPT-Operation-Id")
+            if operation_id:
+                print(f"operation_id={operation_id}", file=sys.stderr)
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    payload = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                for choice in payload.get("choices") or []:
+                    if not isinstance(choice, dict):
+                        continue
+                    delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                    content = delta.get("content") if isinstance(delta, dict) else None
+                    if isinstance(content, str) and content:
+                        text_parts.append(content)
+                        print(content, end="", flush=True)
+    if text_parts:
+        print()
+    return "".join(text_parts)
+
+
+def _completion_text(payload: dict[str, object]) -> str:
+    direct = payload.get("text")
+    if isinstance(direct, str):
+        return direct
+    choices = payload.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str):
+                    return content
+            text = choice.get("text")
+            if isinstance(text, str):
+                return text
+    return ""
+
+
+def _write_text_output(path: Path, text: str) -> None:
+    target = path.expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    print(f"output_path={target.resolve()}")
+
+
+def _print_response_context(payload: dict[str, object]) -> None:
+    for key, label in (
+        ("id", "id"),
+        ("model", "model"),
+        ("chatgpt_model_slug", "provider_model"),
+        ("chatgpt_account", "account"),
+        ("chatgpt_operation_id", "operation_id"),
+        ("chatgpt_conversation_id", "conversation_id"),
+        ("chatgpt_fallback_model", "fallback_model"),
+    ):
+        value = payload.get(key)
+        if value:
+            print(f"{label}={value}")
+
+
+def _image_reference_for_api(path: Path) -> dict[str, object]:
+    source = path.expanduser()
+    if not source.is_file():
+        raise ProviderError(f"input image not found: {source}")
+    mime_type = mimetypes.guess_type(str(source))[0] or "application/octet-stream"
+    encoded = base64.b64encode(source.read_bytes()).decode("ascii")
+    return {
+        "name": source.name,
+        "mime_type": mime_type,
+        "data_url": f"data:{mime_type};base64,{encoded}",
+    }
+
+
+def _print_image_payload(payload: dict[str, object], title: str) -> None:
+    print(_headline(title))
+    _print_response_context(payload)
+    data = payload.get("data")
+    if not isinstance(data, list) or not data:
+        print("data=-")
+        return
+    for index, item in enumerate(data, start=1):
+        if not isinstance(item, dict):
+            continue
+        print(f"image[{index}]")
+        for key in ("url", "download_url", "path", "file_id", "id", "mime_type", "bytes"):
+            value = item.get(key)
+            if value is not None:
+                print(f"  {key}={value}")
+        if item.get("b64_json"):
+            print("  b64_json=<present>")
+
+
+async def _save_api_image_outputs(args: argparse.Namespace, payload: dict[str, object]) -> list[Path]:
+    if not getattr(args, "output_dir", None) and not getattr(args, "output_path", None):
+        return []
+    data = payload.get("data")
+    if not isinstance(data, list) or not data:
+        return []
+
+    saved: list[Path] = []
+    image_items = [item for item in data if isinstance(item, dict)]
+    total = len(image_items)
+    for index, item in enumerate(image_items, start=1):
+        content, content_type = await _api_image_item_bytes(args, item)
+        target = _api_local_output_target(args, item, index=index, total=total, default_suffix=_suffix_for_content_type(content_type))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        saved.append(target.resolve())
+    return saved
+
+
+async def _api_image_item_bytes(args: argparse.Namespace, item: dict[str, object]) -> tuple[bytes, str | None]:
+    raw_b64 = item.get("b64_json")
+    if isinstance(raw_b64, str) and raw_b64:
+        try:
+            return base64.b64decode(raw_b64), _str_or_none(item.get("mime_type"))
+        except Exception as exc:
+            raise ProviderError("image response contained invalid b64_json") from exc
+
+    raw_url = _str_or_none(item.get("download_url")) or _str_or_none(item.get("url"))
+    if raw_url:
+        url = _api_absolute_url(args.base_url, raw_url)
+        headers: dict[str, str] = {}
+        if args.api_key:
+            headers["Authorization"] = f"Bearer {args.api_key}"
+        async with httpx.AsyncClient(timeout=_request_timeout(args), follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+        if response.status_code >= 400:
+            raise ProviderError(f"image download failed: HTTP {response.status_code}: {response.text[:300]}")
+        return response.content, response.headers.get("content-type")
+
+    raw_path = _str_or_none(item.get("path"))
+    if raw_path:
+        path = Path(raw_path).expanduser()
+        if path.is_file():
+            return path.read_bytes(), _str_or_none(item.get("mime_type")) or mimetypes.guess_type(str(path))[0]
+
+    raise ProviderError("image response did not include b64_json, url, download_url, or a readable path")
+
+
+async def _save_api_research_output(args: argparse.Namespace, payload: dict[str, object]) -> Path | None:
+    if not getattr(args, "output_dir", None) and not getattr(args, "output_path", None):
+        return None
+    raw_url = _str_or_none(payload.get("chatgpt_research_report_download_url"))
+    raw_path = _str_or_none(payload.get("chatgpt_research_report_path"))
+    content: bytes
+    if raw_url:
+        url = _api_absolute_url(args.base_url, raw_url)
+        headers: dict[str, str] = {}
+        if args.api_key:
+            headers["Authorization"] = f"Bearer {args.api_key}"
+        async with httpx.AsyncClient(timeout=_request_timeout(args), follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+        if response.status_code >= 400:
+            raise ProviderError(f"research report download failed: HTTP {response.status_code}: {response.text[:300]}")
+        content = response.content
+    elif raw_path and Path(raw_path).expanduser().is_file():
+        content = Path(raw_path).expanduser().read_bytes()
+    else:
+        raise ProviderError("research response did not include a downloadable report")
+
+    item = {"path": raw_path or "research-report.md", "download_url": raw_url or ""}
+    target = _api_local_output_target(args, item, index=1, total=1, default_suffix=".md")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    return target.resolve()
+
+
+def _api_absolute_url(base_url: str, raw_url: str) -> str:
+    if raw_url.startswith("http://") or raw_url.startswith("https://"):
+        return raw_url
+    if raw_url.startswith("/"):
+        parsed = urlparse(base_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else base_url
+        return urljoin(origin.rstrip("/") + "/", raw_url.lstrip("/"))
+    base = base_url.rstrip("/") + "/"
+    return urljoin(base, raw_url)
+
+
+def _api_local_output_target(
+    args: argparse.Namespace,
+    item: dict[str, object],
+    *,
+    index: int,
+    total: int,
+    default_suffix: str,
+) -> Path:
+    if getattr(args, "output_path", None):
+        target = Path(args.output_path).expanduser()
+        if total > 1:
+            target = target.with_name(f"{target.stem}-{index}{target.suffix or default_suffix}")
+        return _ensure_suffix(target, default_suffix)
+
+    output_dir = Path(args.output_dir).expanduser()
+    name = _api_output_filename(item, index=index, default_suffix=default_suffix)
+    return output_dir / name
+
+
+def _api_output_filename(item: dict[str, object], *, index: int, default_suffix: str) -> str:
+    for key in ("path", "download_url", "url", "file_id", "id"):
+        value = _str_or_none(item.get(key))
+        if not value:
+            continue
+        if key in {"download_url", "url"}:
+            value = Path(urlparse(value).path).name
+        else:
+            value = Path(value).name
+        if value:
+            return _ensure_suffix(Path(value), default_suffix).name
+    return f"image-{index}{default_suffix}"
+
+
+def _ensure_suffix(path: Path, suffix: str) -> Path:
+    if path.suffix:
+        return path
+    return path.with_suffix(suffix or ".bin")
+
+
+def _suffix_for_content_type(content_type: str | None) -> str:
+    if content_type:
+        suffix = mimetypes.guess_extension(content_type.split(";", 1)[0].strip())
+        if suffix:
+            return suffix
+    return ".png"
+
+
+def _print_local_paths(paths: list[Path]) -> None:
+    for index, path in enumerate(paths, start=1):
+        print(f"local_path[{index}]={path}")
 
 
 async def _admin_request(
@@ -1906,9 +2782,27 @@ def _print_capacity(payload: dict[str, object]) -> None:
         )
     print()
     print("routes:")
-    for key in ("chat", "images", "usage", "models", "files"):
+    route_order = (
+        "health",
+        "models",
+        "usage",
+        "chat",
+        "images",
+        "image_edits",
+        "vision",
+        "files",
+        "operation",
+        "operation_cancel",
+        "admin_api",
+    )
+    seen_routes: set[str] = set()
+    for key in route_order:
         if routes.get(key):
-            print(f"  {key:<8} {routes[key]}")
+            seen_routes.add(key)
+            print(f"  {key:<18} {routes[key]}")
+    for key in sorted(str(item) for item in routes if str(item) not in seen_routes):
+        if routes.get(key):
+            print(f"  {key:<18} {routes[key]}")
     print("storage:")
     for key in ("image_output_dir", "research_output_dir", "admin_db_path", "artifact_count"):
         if storage.get(key) is not None:
@@ -1943,6 +2837,13 @@ def _color(text: str, code: str) -> str:
     if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
         return text
     return f"\033[{code}m{text}\033[0m"
+
+
+def _terminal_width() -> int:
+    try:
+        return max(72, min(100, os.get_terminal_size().columns))
+    except OSError:
+        return 88
 
 
 def _parse_admin_limit_spec(raw: str) -> tuple[dict[str, int], dict[str, int]]:
@@ -2158,10 +3059,11 @@ async def cmd_serve(args: argparse.Namespace) -> int:
         _apply_interactive_serve_args(args)
     if getattr(args, "secrets_passphrase_prompt", False):
         _prompt_secrets_passphrase()
+    accounts = _server_accounts_from_args(args)
     run_server(
         OpenAICompatConfig(
-            account=args.account,
-            accounts=tuple(item.strip() for item in args.accounts.split(",") if item.strip()),
+            account=_primary_account_from_args(args, accounts),
+            accounts=accounts,
             accounts_dir=args.accounts_dir,
             host=args.host,
             port=args.port,
@@ -2200,7 +3102,7 @@ def _apply_interactive_serve_args(args: argparse.Namespace) -> None:
 
     args.account_strategy = _prompt_choice(
         "routing strategy",
-        ["auto", "sticky", "failover", "round-robin", "weighted", "quota-aware"],
+        ["auto", "sticky", "failover", "random", "round-robin", "weighted", "quota-aware"],
         default=args.account_strategy,
     )
     args.host = _prompt_choice("bind host", ["127.0.0.1", "0.0.0.0"], default=args.host if args.host in {"127.0.0.1", "0.0.0.0"} else "127.0.0.1")

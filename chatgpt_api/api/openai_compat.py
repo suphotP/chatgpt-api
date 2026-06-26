@@ -7,6 +7,7 @@ import base64
 import json
 import mimetypes
 import os
+import random
 import re
 import threading
 import time
@@ -22,6 +23,7 @@ from chatgpt_api.api.config import OpenAICompatConfig
 from chatgpt_api.api.http_utils import (
     authorize as _authorize,
     cancel_operation_id_from_path as _cancel_operation_id_from_path,
+    operation_id_from_path as _operation_id_from_path,
     query_value as _query_value,
     read_json_body as _read_json_body,
     send_cors_headers as _send_cors_headers,
@@ -99,6 +101,8 @@ class AccountRouter:
             weighted = _weighted_account_sequence(self.accounts)
             start = index % len(weighted)
             return tuple(dict.fromkeys(weighted[start:] + weighted[:start]))
+        if self.strategy == "random":
+            return tuple(random.sample(self.accounts, len(self.accounts)))
         return self.accounts
 
     def set_account_limit(self, account: str, limit: int) -> None:
@@ -188,7 +192,7 @@ _CHATGPT_OPERATIONS_LOCK = threading.Lock()
 _CHATGPT_OPERATION_TTL_SECONDS = 3600.0
 
 
-ACCOUNT_STRATEGIES = {"auto", "sticky", "failover", "round-robin", "weighted", "quota-aware"}
+ACCOUNT_STRATEGIES = {"auto", "sticky", "failover", "round-robin", "weighted", "quota-aware", "random"}
 ACCOUNT_CONCURRENCY_BY_PLAN = {
     "free": 1,
     "go": 2,
@@ -209,6 +213,12 @@ CONCURRENCY_WARNINGS = [
     "ChatGPT can still apply hidden burst rate limits. On Pro, image quota may show a high daily number, but rapid parallel generations can still trigger a 5-10 minute cooldown.",
     "Deep Research should stay low because each run is long-lived and can consume scarce monthly quota.",
 ]
+USAGE_FEATURE_ALIASES = {
+    "deep_research": ("deep_research", "openai_deep_research"),
+    "file_upload": ("file_upload", "attachments", "attachment"),
+    "image_gen": ("image_gen", "image_generation", "dalle", "gpt_image"),
+    "paste_text_to_file": ("paste_text_to_file",),
+}
 _IMAGE_REQUEST_CACHE_TTL_SECONDS = 45.0
 _IMAGE_REQUEST_CACHE_LOCK = threading.Lock()
 _ACCOUNT_LIMITER_LOCK = threading.Lock()
@@ -246,6 +256,7 @@ def _normalize_account_strategy(strategy: str | None) -> str:
     aliases = {
         "default": "auto",
         "limit-aware": "quota-aware",
+        "shuffle": "random",
         "rotate": "round-robin",
         "roundrobin": "round-robin",
     }
@@ -290,6 +301,47 @@ def _plan_hint_from_account_name(account: str) -> str | None:
 def _configure_account_limits(config: OpenAICompatConfig, router: AccountRouter) -> None:
     for account in router.accounts:
         router.set_account_limit(account, _account_concurrency_limit(config, account))
+
+
+def _router_for_request(
+    config: OpenAICompatConfig,
+    default_router: AccountRouter | None,
+    body: dict[str, Any],
+) -> AccountRouter:
+    base_router = default_router or AccountRouter(_accounts_for_config(config), config.account_strategy)
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    account = _str_or_none(body.get("chatgpt_account")) or _str_or_none(metadata.get("chatgpt_account"))
+    accounts_value = body.get("chatgpt_accounts", metadata.get("chatgpt_accounts"))
+    strategy = _str_or_none(body.get("chatgpt_account_strategy")) or _str_or_none(metadata.get("chatgpt_account_strategy"))
+    if not account and not accounts_value and not strategy:
+        return base_router
+
+    if account and accounts_value:
+        raise ValueError("use either chatgpt_account or chatgpt_accounts, not both")
+    available = set(_accounts_for_config(config))
+    requested_accounts = _request_account_list(account, accounts_value)
+    if requested_accounts:
+        unknown = [item for item in requested_accounts if item not in available]
+        if unknown:
+            raise ValueError(f"unknown ChatGPT account alias for this server: {', '.join(unknown)}")
+        accounts = tuple(dict.fromkeys(requested_accounts))
+    else:
+        accounts = base_router.accounts
+    router = AccountRouter(accounts, strategy or base_router.strategy)
+    _configure_account_limits(config, router)
+    return router
+
+
+def _request_account_list(account: str | None, accounts_value: Any) -> list[str]:
+    if account:
+        return [account.strip()]
+    if accounts_value is None:
+        return []
+    if isinstance(accounts_value, str):
+        return [part.strip() for part in accounts_value.split(",") if part.strip()]
+    if isinstance(accounts_value, list):
+        return [str(part).strip() for part in accounts_value if str(part).strip()]
+    raise ValueError("chatgpt_accounts must be a comma-separated string or list")
 
 
 def _account_concurrency_limit(config: OpenAICompatConfig, account: str) -> int:
@@ -487,16 +539,41 @@ def _chatgpt_operation_cancel_requested(operation_id: str | None) -> bool:
 
 
 def _chatgpt_operation_payload(operation: _ChatGPTOperation) -> dict[str, Any]:
+    deep_research_ready = bool(
+        operation.conversation_id and operation.deep_research_message_id and operation.deep_research_session_id
+    )
+    pending_reason = None
+    if operation.kind == "research" and not operation.completed and not deep_research_ready:
+        if not operation.provider:
+            pending_reason = "provider_not_selected"
+        elif not operation.conversation_id:
+            pending_reason = "conversation_id_not_available"
+        else:
+            pending_reason = "deep_research_session_not_available"
     return {
         "id": operation.operation_id,
         "kind": operation.kind,
         "account": operation.account,
+        "provider_selected": bool(operation.provider),
         "conversation_id": operation.conversation_id,
+        "deep_research_message_id": operation.deep_research_message_id,
+        "deep_research_session_id": operation.deep_research_session_id,
+        "deep_research_ready": deep_research_ready,
+        "pending_reason": pending_reason,
         "cancel_requested": operation.cancel_requested,
         "completed": operation.completed,
         "last_cancel_result": operation.last_cancel_result,
         "last_cancel_error": operation.last_cancel_error,
     }
+
+
+def _get_chatgpt_operation(operation_id: str) -> tuple[int, dict[str, Any]]:
+    _prune_chatgpt_operations()
+    with _CHATGPT_OPERATIONS_LOCK:
+        operation = _CHATGPT_OPERATIONS.get(operation_id)
+        if operation is None:
+            return 404, {"error": {"message": "operation not found", "type": "not_found"}}
+        return 200, {"object": "chatgpt.operation", "operation": _chatgpt_operation_payload(operation)}
 
 
 def _stop_chatgpt_operation_by_id(operation_id: str | None) -> _ChatGPTOperation | None:
@@ -546,6 +623,8 @@ def _stop_chatgpt_operation(operation: _ChatGPTOperation) -> _ChatGPTOperation:
                 )
             except ProviderError as exc:
                 cancel_errors.append(str(exc))
+        elif operation.kind == "research":
+            cancel_result["deep_research_pending"] = "widget_session_id_not_available"
 
     with _CHATGPT_OPERATIONS_LOCK:
         current = _CHATGPT_OPERATIONS.get(operation.operation_id)
@@ -632,6 +711,69 @@ def _account_order_for_model(
     return tuple(supported + unknown + unsupported) if supported or unknown else ordered
 
 
+async def _account_order_with_usage_preflight(
+    config: OpenAICompatConfig,
+    router: AccountRouter,
+    model_slug: str,
+    thinking_effort: str | None,
+    requirements: tuple[tuple[tuple[str, ...], int], ...],
+) -> list[tuple[str, dict[str, Any] | None]]:
+    ordered = _account_order_for_model(config, router, model_slug, thinking_effort)
+    if not requirements or len(ordered) <= 1 or router.strategy == "sticky":
+        return [(account, None) for account in ordered]
+
+    ranked: list[tuple[tuple[int, float], int, str, dict[str, Any] | None]] = []
+    for index, account in enumerate(ordered):
+        provider = _provider_for_account(config, account)
+        metadata = await _conversation_init_metadata(provider, model_slug)
+        ranked.append((_usage_preflight_rank(metadata, requirements), index, account, metadata))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [(account, metadata) for _rank, _index, account, metadata in ranked]
+
+
+def _usage_preflight_rank(
+    init_metadata: dict[str, Any] | None,
+    requirements: tuple[tuple[tuple[str, ...], int], ...],
+) -> tuple[int, float]:
+    if not isinstance(init_metadata, dict):
+        return (1, 0.0)
+
+    score = 0.0
+    for names, minimum_remaining in requirements:
+        blocked = _matching_feature(init_metadata.get("blocked_features"), *names)
+        if blocked is not None:
+            return (3, 0.0)
+        progress = _matching_feature(init_metadata.get("limits_progress"), *names)
+        if progress is None:
+            score += -1_000_000_000.0
+            continue
+        remaining = progress.get("remaining")
+        if not isinstance(remaining, (int, float)):
+            score += -1_000_000_000.0
+            continue
+        if remaining < minimum_remaining:
+            return (2, float(minimum_remaining - remaining))
+        score += -float(remaining)
+    return (0, score)
+
+
+def _upload_usage_requirements(input_image_count: int) -> tuple[tuple[tuple[str, ...], int], ...]:
+    if input_image_count <= 0:
+        return ()
+    return ((USAGE_FEATURE_ALIASES["file_upload"], input_image_count),)
+
+
+def _image_usage_requirements(input_image_count: int) -> tuple[tuple[tuple[str, ...], int], ...]:
+    requirements: list[tuple[tuple[str, ...], int]] = [(USAGE_FEATURE_ALIASES["image_gen"], 1)]
+    if input_image_count > 0:
+        requirements.append((USAGE_FEATURE_ALIASES["file_upload"], input_image_count))
+    return tuple(requirements)
+
+
+def _research_usage_requirements() -> tuple[tuple[tuple[str, ...], int], ...]:
+    return ((USAGE_FEATURE_ALIASES["deep_research"], 1),)
+
+
 def _account_supports_model(
     config: OpenAICompatConfig,
     account: str,
@@ -688,13 +830,21 @@ def _handler_class(config: OpenAICompatConfig, router: AccountRouter | None = No
         def do_OPTIONS(self) -> None:  # noqa: N802
             _send_cors_preflight(self)
 
+        def do_HEAD(self) -> None:  # noqa: N802
+            parsed_url = urlparse(self.path)
+            download_id = _download_file_id_from_path(parsed_url.path)
+            if download_id:
+                _send_download_file(self, download_id, admin_db_path=config.admin_db_path, include_body=False)
+                return
+            _send_json(self, 404, {"error": {"message": "route not found", "type": "not_found"}})
+
         def do_GET(self) -> None:  # noqa: N802
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             query = parse_qs(parsed_url.query)
             download_id = _download_file_id_from_path(path)
             if download_id:
-                _send_download_file(self, download_id)
+                _send_download_file(self, download_id, admin_db_path=config.admin_db_path)
                 return
             if path == "/admin" or path == "/admin/":
                 _send_console_redirect(self, config)
@@ -756,6 +906,11 @@ def _handler_class(config: OpenAICompatConfig, router: AccountRouter | None = No
                 return
             if path == "/v1/chatgpt/admin/settings":
                 _send_json(self, 200, {"object": "chatgpt.admin.settings", "settings": _bridge_settings(config)})
+                return
+            operation_id = _operation_id_from_path(path)
+            if operation_id:
+                status, payload = _get_chatgpt_operation(operation_id)
+                _send_json(self, status, payload)
                 return
             _send_json(self, 404, {"error": {"message": "not found", "type": "not_found"}})
 
@@ -825,7 +980,7 @@ async def _chat_completion(
     model_slug, thinking_effort = _resolve_model_alias(model, _str_or_none(body.get("thinking_effort")))
     tools = body.get("tools") if isinstance(body.get("tools"), list) else []
     temporary_chat = _resolve_temporary_chat_mode(config, body)
-    router = router or AccountRouter(_accounts_for_config(config), config.account_strategy)
+    router = _router_for_request(config, router, body)
     local_command_response = await _maybe_handle_local_chatgpt_command(config, messages, requested_model, router)
     if local_command_response is not None:
         return local_command_response
@@ -842,25 +997,36 @@ async def _chat_completion(
     )
     if deep_research_response is not None:
         return deep_research_response
+    request_metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    requested_operation_id = _str_or_none(body.get("chatgpt_operation_id")) or _str_or_none(
+        request_metadata.get("chatgpt_operation_id")
+    )
+    operation = _create_chatgpt_operation("chat", requested_operation_id) if requested_operation_id else None
+    operation_id = operation.operation_id if operation else None
+    operation_extra = {"chatgpt_operation_id": operation_id} if operation_id else None
     if not _should_use_agent_bridge(body, tools, model_agent_mode):
-        account, provider, text = await _collect_messages_text_with_accounts(
-            config,
-            router,
-            messages,
-            requested_model,
-            model_slug,
-            thinking_effort,
-            temporary_chat,
-        )
-        if not text:
-            raise OpenAICompatProviderError(
-                _empty_response_error(),
+        try:
+            account, provider, text = await _collect_messages_text_with_accounts(
+                config,
+                router,
+                messages,
                 requested_model,
                 model_slug,
-                await _conversation_init_metadata(provider, model_slug),
-                account=account,
+                thinking_effort,
+                temporary_chat,
+                operation_id=operation_id,
             )
-        return _completion_response(requested_model, text, [], account=account)
+            if not text:
+                raise OpenAICompatProviderError(
+                    _empty_response_error(),
+                    requested_model,
+                    model_slug,
+                    await _conversation_init_metadata(provider, model_slug),
+                    account=account,
+                )
+            return _completion_response(requested_model, text, [], account=account, extra=operation_extra)
+        finally:
+            _finish_chatgpt_operation(operation_id)
     prompt = _build_chat_prompt(messages, tools, body.get("tool_choice"), agent_prompt_mode)
     fallback_model_used: str | None = None
     active_model_slug = model_slug
@@ -874,6 +1040,7 @@ async def _chat_completion(
             model_slug,
             thinking_effort,
             temporary_chat,
+            operation_id=operation_id,
         )
     except OpenAICompatProviderError as exc:
         fallback_model = _model_fallback_for_config(config, model_slug)
@@ -887,6 +1054,7 @@ async def _chat_completion(
                 fallback_model_slug,
                 fallback_effort,
                 temporary_chat,
+                operation_id=operation_id,
             )
             active_model_slug = fallback_model_slug
             active_thinking_effort = fallback_effort
@@ -895,7 +1063,7 @@ async def _chat_completion(
             raise
     if not text:
         if _has_successful_tool_result_after_latest_user(messages) or _has_completed_file_action_after_latest_user(messages):
-            return _completion_response(requested_model, "Done.", [], account=account)
+            return _completion_response(requested_model, "Done.", [], account=account, extra=operation_extra)
         raise OpenAICompatProviderError(
             _empty_response_error(),
             requested_model,
@@ -906,9 +1074,23 @@ async def _chat_completion(
     if _has_completed_file_action_after_latest_user(messages) and (
         _response_is_tool_call_json(text) or _response_abandons_workspace_action(text)
     ):
-        return _completion_response(requested_model, "Done.", [], account=account, fallback_model=fallback_model_used)
+        return _completion_response(
+            requested_model,
+            "Done.",
+            [],
+            account=account,
+            fallback_model=fallback_model_used,
+            extra=operation_extra,
+        )
     if _has_successful_tool_result_after_latest_user(messages) and _response_is_tool_call_json(text):
-        return _completion_response(requested_model, "Done.", [], account=account, fallback_model=fallback_model_used)
+        return _completion_response(
+            requested_model,
+            "Done.",
+            [],
+            account=account,
+            fallback_model=fallback_model_used,
+            extra=operation_extra,
+        )
     tool_calls = _filter_repeated_successful_tool_calls(_parse_tool_calls(text, tools), messages)
     text, tool_calls = await _retry_tool_policy_issues(
         provider,
@@ -942,6 +1124,7 @@ async def _chat_completion(
                 active_model_slug,
                 active_thinking_effort,
                 temporary_chat,
+                operation_id=operation_id,
             )
         except ProviderError as exc:
             raise OpenAICompatProviderError(
@@ -982,7 +1165,17 @@ async def _chat_completion(
             active_thinking_effort,
             temporary_chat,
         )
-    return _completion_response(requested_model, text, tool_calls, account=account, fallback_model=fallback_model_used)
+    try:
+        return _completion_response(
+            requested_model,
+            text,
+            tool_calls,
+            account=account,
+            fallback_model=fallback_model_used,
+            extra=operation_extra,
+        )
+    finally:
+        _finish_chatgpt_operation(operation_id)
 
 
 async def _chat_completion_stream(
@@ -1000,6 +1193,7 @@ async def _chat_completion_stream(
     model_slug, thinking_effort = _resolve_model_alias(model, _str_or_none(body.get("thinking_effort")))
     tools = body.get("tools") if isinstance(body.get("tools"), list) else []
     temporary_chat = _resolve_temporary_chat_mode(config, body)
+    router = _router_for_request(config, router, body)
 
     local_command_response = await _maybe_handle_local_chatgpt_command(config, messages, requested_model, router)
     if local_command_response is not None:
@@ -1141,11 +1335,18 @@ async def _stream_messages_text_with_accounts(
     input_image_count = _provider_message_image_count(provider_messages)
     attempts: list[dict[str, Any]] = []
     last_error: OpenAICompatProviderError | None = None
-    for account in _account_order_for_model(config, router, model_slug, thinking_effort):
+    for account, preflight_metadata in await _account_order_with_usage_preflight(
+        config,
+        router,
+        model_slug,
+        thinking_effort,
+        _upload_usage_requirements(input_image_count),
+    ):
         provider = _provider_for_account(config, account)
-        init_metadata: dict[str, Any] | None = None
+        init_metadata = preflight_metadata
         if input_image_count:
-            init_metadata = await _conversation_init_metadata(provider, model_slug)
+            if init_metadata is None:
+                init_metadata = await _conversation_init_metadata(provider, model_slug)
             preflight_error = _input_upload_preflight_error(init_metadata, input_image_count)
             if preflight_error is not None:
                 compat_error = OpenAICompatProviderError(
@@ -1321,7 +1522,7 @@ async def _image_generation(
         "style": body.get("style"),
         "response_format": body.get("response_format"),
     }
-    router = router or AccountRouter(_accounts_for_config(config), config.account_strategy)
+    router = _router_for_request(config, router, body)
     response_format = _str_or_none(body.get("response_format")) or "url"
     output_path = _str_or_none(body.get("output_path")) or _str_or_none(body.get("path"))
     output_dir = _str_or_none(body.get("output_dir"))
@@ -1397,7 +1598,7 @@ async def _image_edit(
         "input_image_count": len(input_images),
         "aspect_ratio_warning": IMAGE_EDIT_ASPECT_RATIO_WARNING,
     }
-    router = router or AccountRouter(_accounts_for_config(config), config.account_strategy)
+    router = _router_for_request(config, router, body)
     response_format = _str_or_none(body.get("response_format")) or "url"
     output_path = _str_or_none(body.get("output_path")) or _str_or_none(body.get("path"))
     output_dir = _str_or_none(body.get("output_dir"))
@@ -1470,7 +1671,7 @@ async def _vision_request(
     model, _ = _split_model_agent_mode(requested_model)
     model_slug, thinking_effort = _resolve_model_alias(model, _str_or_none(body.get("thinking_effort")))
     temporary_chat = _resolve_temporary_chat_mode(config, body)
-    router = router or AccountRouter(_accounts_for_config(config), config.account_strategy)
+    router = _router_for_request(config, router, body)
     parts = [
         *(ContentPart.image_bytes(image.data, image.mime_type, image.name) for image in input_images),
         ContentPart.text_part(prompt),
@@ -1619,44 +1820,54 @@ async def _maybe_handle_deep_research_request(
             [],
         )
 
-    account, _, text, research_metadata = await _collect_deep_research_with_accounts(
-        config,
-        router,
-        latest,
-        requested_model,
-        model_slug,
+    request_metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    requested_operation_id = _str_or_none(body.get("chatgpt_operation_id")) or _str_or_none(
+        request_metadata.get("chatgpt_operation_id")
     )
-    if not text:
-        raise OpenAICompatProviderError(
-            _empty_response_error(),
+    operation = _create_chatgpt_operation("research", requested_operation_id)
+    try:
+        account, _, text, research_metadata = await _collect_deep_research_with_accounts(
+            config,
+            router,
+            latest,
             requested_model,
             model_slug,
-            account=account,
+            operation_id=operation.operation_id,
         )
-    report_text = _clean_deep_research_markdown(text)
-    report_path = _save_deep_research_report(config, body, latest, report_text)
-    report_asset = _register_download_file(
-        report_path,
-        content_type="text/markdown; charset=utf-8",
-        public_base_url=config.public_base_url,
-        admin_db_path=config.admin_db_path,
-        kind="research",
-        account=account,
-        prompt=latest,
-        metadata=research_metadata,
-    )
-    return _completion_response(
-        requested_model,
-        _deep_research_done_message(report_path, str(report_asset["download_url"])),
-        [],
-        account=account,
-        extra={
-            "chatgpt_research_report_path": str(report_path),
-            "chatgpt_research_report_download_url": report_asset["download_url"],
-            "chatgpt_research_report_file": report_asset,
-            "chatgpt_research": research_metadata,
-        },
-    )
+        if not text:
+            raise OpenAICompatProviderError(
+                _empty_response_error(),
+                requested_model,
+                model_slug,
+                account=account,
+            )
+        report_text = _clean_deep_research_markdown(text)
+        report_path = _save_deep_research_report(config, body, latest, report_text)
+        report_asset = _register_download_file(
+            report_path,
+            content_type="text/markdown; charset=utf-8",
+            public_base_url=config.public_base_url,
+            admin_db_path=config.admin_db_path,
+            kind="research",
+            account=account,
+            prompt=latest,
+            metadata=research_metadata,
+        )
+        return _completion_response(
+            requested_model,
+            _deep_research_done_message(report_path, str(report_asset["download_url"])),
+            [],
+            account=account,
+            extra={
+                "chatgpt_operation_id": operation.operation_id,
+                "chatgpt_research_report_path": str(report_path),
+                "chatgpt_research_report_download_url": report_asset["download_url"],
+                "chatgpt_research_report_file": report_asset,
+                "chatgpt_research": research_metadata,
+            },
+        )
+    finally:
+        _finish_chatgpt_operation(operation.operation_id)
 
 
 def _image_request_with_operation_hooks(request: ImageRequest, operation_id: str | None) -> ImageRequest:
@@ -1692,9 +1903,16 @@ async def _generate_image_with_accounts(
     attempts: list[dict[str, Any]] = []
     last_error: OpenAICompatProviderError | None = None
     input_image_count = len(request.input_images) + (1 if request.image is not None else 0)
-    for account in _account_order_for_model(config, router, model_slug, None):
+    for account, init_metadata in await _account_order_with_usage_preflight(
+        config,
+        router,
+        model_slug,
+        None,
+        _image_usage_requirements(input_image_count),
+    ):
         provider = _provider_for_account(config, account)
-        init_metadata = await _conversation_init_metadata(provider, model_slug)
+        if init_metadata is None:
+            init_metadata = await _conversation_init_metadata(provider, model_slug)
         preflight_error = _image_request_preflight_error(init_metadata, input_image_count)
         if preflight_error is not None:
             compat_error = OpenAICompatProviderError(
@@ -2017,25 +2235,47 @@ def _download_file_id_from_path(path: str) -> str | None:
     return None
 
 
-def _send_download_file(handler: BaseHTTPRequestHandler, file_id: str) -> None:
+def _send_download_file(
+    handler: BaseHTTPRequestHandler,
+    file_id: str,
+    *,
+    admin_db_path: Path | None = None,
+    include_body: bool = True,
+) -> None:
     with _DOWNLOAD_FILES_LOCK:
         entry = _DOWNLOAD_FILES.get(file_id)
+    if entry is None and admin_db_path is not None:
+        artifact = BridgeAdminStore(admin_db_path).get_artifact(file_id)
+        if artifact is not None:
+            path = Path(str(artifact.get("path") or "")).expanduser()
+            if not path.is_file():
+                _send_json(handler, 410, {"error": {"message": "artifact file is no longer available", "type": "gone"}})
+                return
+            entry = _DownloadFile(
+                path=path,
+                filename=str(artifact.get("filename") or path.name or "download"),
+                content_type=str(artifact.get("content_type") or _guess_download_content_type(path)),
+                created_at=time.time(),
+            )
+            with _DOWNLOAD_FILES_LOCK:
+                _DOWNLOAD_FILES[file_id] = entry
     if entry is None:
         _send_json(handler, 404, {"error": {"message": "artifact not found", "type": "not_found"}})
         return
     if not entry.path.is_file():
         _send_json(handler, 410, {"error": {"message": "artifact file is no longer available", "type": "gone"}})
         return
-    body = entry.path.read_bytes()
+    size = entry.path.stat().st_size
     handler.send_response(200)
     handler.send_header("Content-Type", entry.content_type)
-    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Content-Length", str(size))
     handler.send_header("Cache-Control", "private, max-age=31536000")
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.send_header("X-Content-Type-Options", "nosniff")
     handler.send_header("Content-Disposition", _content_disposition(entry.filename))
     handler.end_headers()
-    handler.wfile.write(body)
+    if include_body:
+        handler.wfile.write(entry.path.read_bytes())
 
 
 def _send_admin_asset(handler: BaseHTTPRequestHandler, path: str) -> None:
@@ -2147,6 +2387,8 @@ def _admin_status_response(config: OpenAICompatConfig, router: AccountRouter) ->
             "image_edits": "/v1/images/edits",
             "vision": "/v1/chatgpt/vision",
             "files": "/v1/chatgpt/files/{id}/{filename}",
+            "operation": "/v1/chatgpt/operations/{operation_id}",
+            "operation_cancel": "/v1/chatgpt/operations/{operation_id}/cancel",
             "admin_api": "/v1/chatgpt/admin/*",
         },
     }
@@ -2790,16 +3032,24 @@ async def _collect_messages_text_with_accounts(
     model_slug: str,
     thinking_effort: str | None,
     temporary_chat: bool,
+    operation_id: str | None = None,
 ) -> tuple[str, ChatGPTProvider, str]:
     attempts: list[dict[str, Any]] = []
     last_error: OpenAICompatProviderError | None = None
     provider_messages = _openai_messages_to_provider_messages(messages)
     input_image_count = _provider_message_image_count(provider_messages)
-    for account in _account_order_for_model(config, router, model_slug, thinking_effort):
+    for account, preflight_metadata in await _account_order_with_usage_preflight(
+        config,
+        router,
+        model_slug,
+        thinking_effort,
+        _upload_usage_requirements(input_image_count),
+    ):
         provider = _provider_for_account(config, account)
-        init_metadata: dict[str, Any] | None = None
+        init_metadata = preflight_metadata
         if input_image_count:
-            init_metadata = await _conversation_init_metadata(provider, model_slug)
+            if init_metadata is None:
+                init_metadata = await _conversation_init_metadata(provider, model_slug)
             preflight_error = _input_upload_preflight_error(init_metadata, input_image_count)
             if preflight_error is not None:
                 compat_error = OpenAICompatProviderError(
@@ -2816,12 +3066,20 @@ async def _collect_messages_text_with_accounts(
                     continue
                 raise compat_error from preflight_error
         try:
+            _update_chatgpt_operation(operation_id, account=account, provider=provider)
             features = ("upload", "chat") if input_image_count else ("chat",)
             text = await _with_provider_feature_limits(
                 config,
                 provider,
                 features,
-                lambda: _collect_messages_text(provider, provider_messages, model_slug, thinking_effort, temporary_chat),
+                lambda: _collect_messages_text(
+                    provider,
+                    provider_messages,
+                    model_slug,
+                    thinking_effort,
+                    temporary_chat,
+                    operation_id=operation_id,
+                ),
             )
         except ProviderError as exc:
             init_metadata = init_metadata or await _conversation_init_metadata(provider, model_slug)
@@ -2934,17 +3192,26 @@ async def _collect_prompt_text_with_accounts(
     model_slug: str,
     thinking_effort: str | None,
     temporary_chat: bool,
+    operation_id: str | None = None,
 ) -> tuple[str, ChatGPTProvider, str, dict[str, Any]]:
     attempts: list[dict[str, Any]] = []
     last_error: OpenAICompatProviderError | None = None
     for account in _account_order_for_model(config, router, model_slug, thinking_effort):
         provider = _provider_for_account(config, account)
         try:
+            _update_chatgpt_operation(operation_id, account=account, provider=provider)
             text = await _with_provider_feature_limit(
                 config,
                 provider,
                 "chat",
-                lambda: _collect_prompt_text(provider, prompt, model_slug, thinking_effort, temporary_chat),
+                lambda: _collect_prompt_text(
+                    provider,
+                    prompt,
+                    model_slug,
+                    thinking_effort,
+                    temporary_chat,
+                    operation_id=operation_id,
+                ),
             )
         except ProviderError as exc:
             init_metadata = await _conversation_init_metadata(provider, model_slug)
@@ -2995,12 +3262,20 @@ async def _collect_deep_research_with_accounts(
     prompt: str,
     requested_model: str,
     model_slug: str,
+    operation_id: str | None = None,
 ) -> tuple[str, ChatGPTProvider, str, dict[str, Any]]:
     attempts: list[dict[str, Any]] = []
     last_error: OpenAICompatProviderError | None = None
-    for account in router.order():
+    for account, init_metadata in await _account_order_with_usage_preflight(
+        config,
+        router,
+        model_slug,
+        None,
+        _research_usage_requirements(),
+    ):
         provider = _provider_for_account(config, account)
-        init_metadata = await _conversation_init_metadata(provider, model_slug)
+        if init_metadata is None:
+            init_metadata = await _conversation_init_metadata(provider, model_slug)
         preflight_error = _deep_research_preflight_error(init_metadata)
         if preflight_error is not None:
             compat_error = OpenAICompatProviderError(
@@ -3031,11 +3306,12 @@ async def _collect_deep_research_with_accounts(
                 continue
             raise compat_error
         try:
+            _update_chatgpt_operation(operation_id, account=account, provider=provider)
             result = await _with_provider_feature_limit(
                 config,
                 provider,
                 "research",
-                lambda: _collect_deep_research_text(provider, prompt, model_slug),
+                lambda: _collect_deep_research_text(provider, prompt, model_slug, operation_id=operation_id),
             )
         except ProviderError as exc:
             compat_error = OpenAICompatProviderError(
@@ -3112,7 +3388,7 @@ def _image_request_preflight_error(init_metadata: dict[str, Any] | None, input_i
         return None
     image_error = _feature_limit_error(
         init_metadata,
-        ("image_gen", "image_generation", "dalle", "gpt_image"),
+        USAGE_FEATURE_ALIASES["image_gen"],
         "ChatGPT image generation",
         minimum_remaining=1,
     )
@@ -3121,7 +3397,7 @@ def _image_request_preflight_error(init_metadata: dict[str, Any] | None, input_i
     if input_image_count > 0:
         upload_error = _feature_limit_error(
             init_metadata,
-            ("file_upload", "attachments", "attachment"),
+            USAGE_FEATURE_ALIASES["file_upload"],
             "ChatGPT file upload",
             minimum_remaining=input_image_count,
         )
@@ -3135,7 +3411,7 @@ def _input_upload_preflight_error(init_metadata: dict[str, Any] | None, input_im
         return None
     return _feature_limit_error(
         init_metadata,
-        ("file_upload", "attachments", "attachment"),
+        USAGE_FEATURE_ALIASES["file_upload"],
         "ChatGPT file upload",
         minimum_remaining=input_image_count,
     )
@@ -3194,10 +3470,15 @@ def _matching_feature(features: Any, *names: str) -> dict[str, Any] | None:
     return None
 
 
-async def _collect_text(provider: ChatGPTProvider, request: ChatRequest) -> str:
+async def _collect_text(provider: ChatGPTProvider, request: ChatRequest, operation_id: str | None = None) -> str:
     async def operation() -> str:
         chunks: list[str] = []
         async for delta in provider.stream_chat(request):
+            if delta.conversation_id:
+                _update_chatgpt_operation(operation_id, conversation_id=delta.conversation_id)
+                if _chatgpt_operation_cancel_requested(operation_id):
+                    _stop_chatgpt_operation_by_id(operation_id)
+                    raise ProviderError("ChatGPT operation cancelled")
             if delta.text:
                 chunks.append(delta.text)
         return "".join(chunks).strip()
@@ -3205,23 +3486,40 @@ async def _collect_text(provider: ChatGPTProvider, request: ChatRequest) -> str:
     return await _with_provider_account_limit(provider, operation)
 
 
-async def _collect_deep_research_text(provider: ChatGPTProvider, prompt: str, model_slug: str) -> tuple[str, dict[str, Any]]:
+async def _collect_deep_research_text(
+    provider: ChatGPTProvider,
+    prompt: str,
+    model_slug: str,
+    operation_id: str | None = None,
+) -> tuple[str, dict[str, Any]]:
     async def operation() -> Any:
+        metadata: dict[str, Any] = {
+            "history_and_training_disabled": False,
+            "system_hints": [DEEP_RESEARCH_SYSTEM_HINT],
+            "selected_sources": [],
+            "selected_github_repos": [],
+            "selected_all_github_repos": False,
+            "serialization_metadata": {"custom_symbol_offsets": []},
+            "deep_research_version": "standard",
+            "venus_model_variant": "standard",
+        }
+        if operation_id:
+            def on_deep_research_session(conversation_id: str | None, message_id: str | None, session_id: str | None) -> None:
+                _update_chatgpt_operation(
+                    operation_id,
+                    conversation_id=conversation_id,
+                    deep_research_message_id=message_id,
+                    deep_research_session_id=session_id,
+                )
+
+            metadata["on_deep_research_session"] = on_deep_research_session
+            metadata["cancel_requested"] = lambda: _chatgpt_operation_cancel_requested(operation_id)
         return await provider.transport.deep_research(
             ChatRequest(
                 messages=[Message.text("user", prompt)],
                 model=model_slug,
                 stream=True,
-                metadata={
-                    "history_and_training_disabled": False,
-                    "system_hints": [DEEP_RESEARCH_SYSTEM_HINT],
-                    "selected_sources": [],
-                    "selected_github_repos": [],
-                    "selected_all_github_repos": False,
-                    "serialization_metadata": {"custom_symbol_offsets": []},
-                    "deep_research_version": "standard",
-                    "venus_model_variant": "standard",
-                },
+                metadata=metadata,
             ),
         )
 
@@ -3235,6 +3533,7 @@ async def _collect_messages_text(
     model_slug: str,
     thinking_effort: str | None,
     temporary_chat: bool,
+    operation_id: str | None = None,
 ) -> str:
     return await _collect_text(
         provider,
@@ -3245,6 +3544,7 @@ async def _collect_messages_text(
             stream=True,
             metadata={"history_and_training_disabled": temporary_chat},
         ),
+        operation_id=operation_id,
     )
 
 
@@ -3254,6 +3554,7 @@ async def _collect_prompt_text(
     model_slug: str,
     thinking_effort: str | None,
     temporary_chat: bool,
+    operation_id: str | None = None,
 ) -> str:
     return await _collect_text(
         provider,
@@ -3264,6 +3565,7 @@ async def _collect_prompt_text(
             stream=True,
             metadata={"history_and_training_disabled": temporary_chat},
         ),
+        operation_id=operation_id,
     )
 
 
@@ -3588,6 +3890,13 @@ def _provider_status_code(message: str) -> int | None:
 
 def _classify_provider_error(message: str, provider_status: int | None) -> tuple[str, str, int, str]:
     normalized = message.lower()
+    if "cancelled" in normalized or "canceled" in normalized:
+        return (
+            "chatgpt_operation_cancelled",
+            "request_cancelled",
+            499,
+            "The bridge operation was cancelled by request.",
+        )
     if "account capture" in normalized and "not configured" in normalized:
         return (
             "chatgpt_missing_account_capture",
@@ -3994,16 +4303,10 @@ def _md_cell(value: Any) -> str:
 
 
 def _usage_features(init_metadata: dict[str, Any]) -> dict[str, Any]:
-    aliases = {
-        "deep_research": ("deep_research", "openai_deep_research"),
-        "file_upload": ("file_upload", "attachments", "attachment"),
-        "image_gen": ("image_gen", "image_generation", "dalle", "gpt_image"),
-        "paste_text_to_file": ("paste_text_to_file",),
-    }
     progress = init_metadata.get("limits_progress")
     blocked_features = init_metadata.get("blocked_features")
     result: dict[str, Any] = {}
-    for key, names in aliases.items():
+    for key, names in USAGE_FEATURE_ALIASES.items():
         limit = _matching_feature(progress, *names)
         blocked = _matching_feature(blocked_features, *names)
         result[key] = _compact_usage_feature(limit, blocked)

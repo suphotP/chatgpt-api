@@ -54,7 +54,7 @@ downloads, and developer tooling.
 <table>
   <tr>
     <td><strong>Local API</strong><br><code>/v1/chat/completions</code>, images, edits, vision, research, files, admin routes.</td>
-    <td><strong>Account Router</strong><br>Use one account or combine several accounts with failover, round-robin, weighted, or quota-aware routing.</td>
+    <td><strong>Account Router</strong><br>Use one account or combine several accounts with failover, random, round-robin, weighted, or quota-aware routing.</td>
   </tr>
   <tr>
     <td><strong>Operator Console</strong><br>Health, accounts, capacity, docs, storage, test lab, and opencode setup in a dedicated UI.</td>
@@ -86,7 +86,7 @@ downloads, and developer tooling.
 | Image edit / composite | `POST /v1/images/edits` | implemented, one output image |
 | OCR / describe up to 10 images | `POST /v1/chatgpt/vision` | implemented |
 | Deep Research report export | `chatgpt-deep-research` model alias | implemented |
-| File downloads | `GET /v1/chatgpt/files/{id}/{filename}` | implemented |
+| File downloads | `GET/HEAD /v1/chatgpt/files/{id}/{filename}` | implemented |
 | Account usage and limits | `GET /v1/chatgpt/usage` | implemented when ChatGPT reports data |
 | opencode consumer config | `integrations/opencode/*` | implemented |
 | Character game use case | `apps/character-game` | included as a working reference app |
@@ -406,7 +406,6 @@ Or use explicit flags:
 
 ```sh
 python3 -m chatgpt_api server start \
-  --accounts free-main,pro-main \
   --account-strategy failover \
   --api-key local-dev-key \
   --host 127.0.0.1 \
@@ -418,7 +417,6 @@ For LAN use:
 
 ```sh
 python3 -m chatgpt_api server start \
-  --accounts free-main,pro-main \
   --account-strategy failover \
   --api-key local-dev-key \
   --host 0.0.0.0 \
@@ -426,9 +424,11 @@ python3 -m chatgpt_api server start \
   --public-base-url http://192.168.1.203:8000/v1
 ```
 
-`--account` and `--accounts` are local account aliases you choose, such as
-`free-main`, `pro-main`, `free-2`, or `work-pro`. They are not automatic plan
-selectors.
+If you omit `--accounts`, the server auto-discovers saved captures under
+`secrets/accounts/*`. Use `--accounts free,go,plus,pro` only when you want to
+pin a clean route pool or skip an old/broken capture. `--account` and
+`--accounts` are local aliases you choose, such as `free`, `go`, `plus-main`,
+`pro-main`, `free-2`, or `work-pro`; they are not automatic plan selectors.
 
 ## Account Capture
 
@@ -458,8 +458,8 @@ Recommended routine:
 8. Find the request to `https://chatgpt.com/backend-api/f/conversation`.
 9. Copy the request in one of these supported formats:
    - Chrome/Safari headers plus the full JSON payload or Safari `Request Data`.
-   - Chrome/Safari `Copy as cURL` output, including every `-H ...` header and
-     the `--data-raw ...` JSON body.
+   - Chrome/Safari `Copy as cURL` output, including Authorization, cookies
+     through `Cookie:` or `-b`, and the `--data-raw ...` JSON body.
 10. Paste the capture into the console account modal or save it to a local text
     file.
 
@@ -562,7 +562,8 @@ required pieces are missing.
 | `POST /v1/images/generations` | Generate one completed image and save it. |
 | `POST /v1/images/edits` | Upload source image(s), edit or composite them, and save one completed image. |
 | `POST /v1/chatgpt/vision` | OCR, describe, or custom vision prompt for up to 10 input images. |
-| `GET /v1/chatgpt/files/{file_id}/{filename}` | Download generated images or Deep Research reports. |
+| `GET/HEAD /v1/chatgpt/files/{file_id}/{filename}` | Download generated images or Deep Research reports. `HEAD` returns the same metadata headers without the file body. |
+| `GET /v1/chatgpt/operations/{operation_id}` | Inspect whether a long job has a selected account, conversation id, or Deep Research widget session. |
 | `POST /v1/chatgpt/operations/{operation_id}/cancel` | Cancel long chat, image, or research work when possible. |
 | `/v1/chatgpt/admin/*` | Local operator routes used by the console and CLI. |
 
@@ -776,7 +777,9 @@ Accepted image inputs:
 - arrays through `images`, `input_images`, or multimodal chat content
 
 One request can include up to 10 input images. Upload concurrency is shared by
-OCR, describe, image edit, and image composite requests.
+OCR, describe, chat-with-image, image edit, and image composite requests. The
+same request also consumes ChatGPT `file_upload` usage when that quota is
+reported by the account metadata.
 
 ## Deep Research
 
@@ -827,9 +830,19 @@ temporary chats.
 
 Long requests return a `chatgpt_operation_id` when the bridge can expose one.
 Frontends should cancel provider work when the user clicks cancel, closes a
-route, refreshes the page, or aborts a request.
+route, refreshes the page, or aborts a request. Cancellation is best effort.
+Operation records are runtime state, not durable storage. They are intended for
+the currently running request and are lost when the API process or container
+restarts. Completed artifact download URLs are separate and can survive restarts
+when the artifact file and admin DB are persisted.
+For Deep Research, the bridge reads the ChatGPT widget session from the WSS
+stream first, then sends the Deep Research MCP `stop` call once it has
+`conversation_id`, assistant `message_id`, and widget `session_id`.
 
 ```sh
+curl 'http://127.0.0.1:8000/v1/chatgpt/operations/chatgptop_abc' \
+  -H 'Authorization: Bearer local-dev-key'
+
 curl 'http://127.0.0.1:8000/v1/chatgpt/operations/chatgptop_abc/cancel' \
   -X POST \
   -H 'Authorization: Bearer local-dev-key'
@@ -839,17 +852,30 @@ Example response:
 
 ```json
 {
-  "ok": true,
+  "status": "ok",
   "operation": {
-    "operation_id": "chatgptop_abc",
-    "kind": "image",
-    "status": "cancel_requested"
-  },
-  "provider_stop": {
-    "status": "ok"
+    "id": "chatgptop_abc",
+    "kind": "research",
+    "provider_selected": true,
+    "conversation_id": "conversation-id",
+    "deep_research_ready": true,
+    "pending_reason": null,
+    "cancel_requested": true,
+    "completed": false,
+    "last_cancel_result": {
+      "conversation": {
+        "status": "ok"
+      }
+    }
   }
 }
 ```
+
+If the stop identifiers are not known yet, the operation is marked
+`cancel_requested` and the provider stop is attempted as soon as the running
+request reaches the point where those identifiers are available. For a manual
+Deep Research cancel, poll the operation route until `deep_research_ready=true`
+or until the ChatGPT research job has passed the bypass / confirmation stage.
 
 ## Models
 
@@ -884,6 +910,7 @@ Routing strategies:
 auto
 sticky
 failover
+random
 round-robin
 weighted
 quota-aware
@@ -897,6 +924,20 @@ Recommended local concurrency defaults:
 | upload | 1 | 1 | 1 | 1 |
 | image | 1 | 1 | 2 | 3 |
 | research | 1 | 1 | 2 | 2 |
+
+`upload` is the source-image bucket. It is used before OCR, image
+description, chat-with-image, image edits, and multi-image composites. For
+edit/composite requests the bridge checks both `image_gen` and `file_upload`
+when ChatGPT reports those features. For Deep Research it checks
+`deep_research`.
+
+When several accounts are configured, normal routing order is still respected,
+but image-input, image-generation, and research requests preflight reported
+feature quota first. Accounts with a blocked or exhausted reported feature move
+behind accounts that still look usable. If ChatGPT returns `not_reported`, the
+bridge treats that as unknown capacity rather than blocked; this avoids
+incorrectly skipping accounts whose plan simply does not expose that counter.
+Hidden burst limits can still happen after preflight.
 
 Two Pro accounts with image concurrency `3` each can run up to six local image
 jobs. That is only a local throttle. ChatGPT Web can still apply hidden burst
@@ -938,15 +979,18 @@ outputs/chatgpt-research/
 The API also registers an HTTP download route:
 
 ```text
-GET /v1/chatgpt/files/{file_id}/{filename}
+GET/HEAD /v1/chatgpt/files/{file_id}/{filename}
 ```
+
+Download URLs survive API restarts when the artifact file and admin DB path are
+kept on disk or mounted as Docker volumes. `GET` returns the file body; `HEAD`
+returns the same metadata headers for clients that probe before downloading.
 
 For LAN clients, start the API with `--host 0.0.0.0` and set
 `--public-base-url` to the LAN address:
 
 ```sh
 python3 -m chatgpt_api server start \
-  --accounts free-main,pro-main \
   --host 0.0.0.0 \
   --port 8000 \
   --api-key local-dev-key \
@@ -1146,6 +1190,12 @@ Print launch presets:
 python3 -m chatgpt_api server command --preset local
 python3 -m chatgpt_api server command --preset lan
 python3 -m chatgpt_api server command --preset docker
+python3 -m chatgpt_api server command \
+  --preset local \
+  --host 127.0.0.1 \
+  --port 8010 \
+  --public-base-url http://127.0.0.1:8010/v1 \
+  --account-strategy random
 python3 -m chatgpt_api admin presets
 ```
 
@@ -1153,14 +1203,15 @@ Start the API:
 
 ```sh
 python3 -m chatgpt_api server start --interactive
-python3 -m chatgpt_api server start --accounts free-main,pro-main --api-key local-dev-key
+python3 -m chatgpt_api server start --api-key local-dev-key
+python3 -m chatgpt_api server start --accounts free,go,plus,pro --account-strategy random --api-key local-dev-key
 ```
 
 Start with a passphrase-derived key instead of the auto key file (prompts at
 launch, never written to disk):
 
 ```sh
-python3 -m chatgpt_api server start --accounts free-main,pro-main --secrets-passphrase-prompt
+python3 -m chatgpt_api server start --secrets-passphrase-prompt
 ```
 
 Rotate account-capture encryption onto a passphrase (or back onto a fresh
@@ -1171,32 +1222,67 @@ python3 -m chatgpt_api secrets rotate --accounts-dir secrets/accounts --to-passp
 python3 -m chatgpt_api secrets rotate --accounts-dir secrets/accounts
 ```
 
-Direct provider chat:
+API chat through the running server and router:
 
 ```sh
-python3 -m chatgpt_api chat \
-  --account pro-main \
-  --message "Reply with exactly: direct chat ok"
+python3 -m chatgpt_api api chat \
+  --message "Reply with exactly: bridge ok" \
+  --accounts free,go,plus,pro \
+  --account-strategy random \
+  --base-url http://127.0.0.1:8000/v1 \
+  --api-key local-dev-key
 ```
 
-Direct image:
+API image generation:
 
 ```sh
-python3 -m chatgpt_api image \
-  --account pro-main \
+python3 -m chatgpt_api api image \
   --prompt "small blue app icon, no text" \
-  --out ./icon.png
+  --output-dir ./outputs/manual-images \
+  --base-url http://127.0.0.1:8000/v1 \
+  --api-key local-dev-key
 ```
 
-Direct OCR:
+API OCR / vision:
 
 ```sh
-python3 -m chatgpt_api vision \
-  --account pro-main \
+python3 -m chatgpt_api api vision \
   --mode ocr \
   --input-image ./favicon.png \
-  --prompt "Extract visible letters only"
+  --prompt "Extract visible letters only" \
+  --base-url http://127.0.0.1:8000/v1 \
+  --api-key local-dev-key
 ```
+
+API Deep Research with cancellation:
+
+```sh
+python3 -m chatgpt_api api research \
+  --prompt "Briefly research whether LLMs could reach AGI." \
+  --operation-id chatgptop_research_demo \
+  --base-url http://127.0.0.1:8000/v1 \
+  --api-key local-dev-key
+
+python3 -m chatgpt_api api operation \
+  --operation-id chatgptop_research_demo \
+  --base-url http://127.0.0.1:8000/v1 \
+  --api-key local-dev-key
+
+python3 -m chatgpt_api api cancel \
+  --operation-id chatgptop_research_demo \
+  --base-url http://127.0.0.1:8000/v1 \
+  --api-key local-dev-key
+```
+
+For Deep Research, wait until `api operation` shows
+`deep_research_ready=yes` before expecting the MCP stop call to happen
+immediately. Cancelling earlier still marks the operation as
+`cancel_requested`, then the bridge attempts the stop once the widget session is
+known.
+
+The older direct provider commands (`chat`, `image`, `vision`) still exist for
+local capture diagnostics. Use `api ...` when you want the real server route,
+account strategy, artifact store, and operation cancellation behavior.
 
 ## Troubleshooting
 
@@ -1239,8 +1325,8 @@ Common environment variables:
 | `CHATGPT_API_HOST` | `127.0.0.1` locally, `0.0.0.0` in Docker | API bind host. |
 | `CHATGPT_API_PORT` | `8000` | API port. |
 | `CHATGPT_API_KEY` | `local-dev-key` in examples | Local bearer key. |
-| `CHATGPT_ACCOUNT` | `free` | Primary account alias. |
-| `CHATGPT_ACCOUNTS` | empty locally, compose uses examples | Comma-separated account aliases. |
+| `CHATGPT_ACCOUNT` | empty | Optional primary account alias. When blank, the first discovered/pinned account is used. |
+| `CHATGPT_ACCOUNTS` | empty | Optional comma-separated account aliases. When blank, saved captures under `secrets/accounts/*` are auto-discovered. |
 | `CHATGPT_ACCOUNT_STRATEGY` | `auto` locally, `failover` in compose | Account routing strategy. |
 | `CHATGPT_ACCOUNTS_DIR` | `./secrets/accounts` | Account capture directory. |
 | `CHATGPT_PUBLIC_BASE_URL` | `http://127.0.0.1:8000/v1` | Download URL base for artifacts. |
@@ -1257,6 +1343,20 @@ Common environment variables:
 | `CHATGPT_RESEARCH_CONCURRENCY` | plan defaults | Local Deep Research throttle. |
 
 See [.env.example](.env.example) for the complete local template.
+
+## Updating An Existing Checkout
+
+Existing account captures and settings remain compatible with the current
+code. Saved captures under `secrets/accounts/<account>/chatgpt-request.txt`
+are still read from the same path, encrypted captures are decrypted with the
+existing secrets key, and legacy plaintext captures are still read
+transparently. If `CHATGPT_ACCOUNTS` is blank, the server continues to
+auto-discover saved account folders.
+
+Newer routing only adds extra preflight ordering for reported usage. It does
+not change the account file format or require users to recreate captures. Keep
+the same Docker volume mounts for `./secrets/accounts` and `./outputs` so
+account captures, admin metadata, and generated files survive rebuilds.
 
 ## Docker
 

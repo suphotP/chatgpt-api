@@ -1,3 +1,6 @@
+import pytest
+
+from chatgpt_api.core.errors import ProviderError
 from chatgpt_api.core.types import ChatRequest, ContentPart, ImageInput, ImageRequest, Message
 from chatgpt_api.providers.chatgpt.auth import ChatGPTAuthConfig
 from chatgpt_api.providers.chatgpt.transport import (
@@ -441,6 +444,57 @@ def test_deep_research_widget_info_finds_websocket_topic_inputs():
     assert info is not None
     assert info.websocket_url == "wss://ws.chatgpt.test/session"
     assert info.widget_session_id == "widget-123"
+
+
+def test_deep_research_cancel_uses_widget_session_ids(monkeypatch):
+    transport = ChatGPTWebTransport(ChatGPTAuthConfig(access_token="fake"), refresh_web_tokens=False)
+    sessions = []
+    stops = []
+
+    events = [
+        {"v": {"conversation_id": "conversation-1", "message": {"id": "message-1"}}},
+        {
+            "v": {
+                "message": {
+                    "metadata": {
+                        "chatgpt_sdk": {
+                            "tool_response_metadata": {
+                                "websocket_url": "wss://ws.chatgpt.test/session",
+                                "openai/widgetSessionId": "widget-123",
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    ]
+
+    monkeypatch.setattr(transport, "_post_conversation", lambda url, headers, payload: events)
+    monkeypatch.setattr(transport, "_maybe_skip_deep_research_sleep", lambda *args, **kwargs: {})
+    monkeypatch.setattr(transport, "_maybe_confirm_deep_research_plan", lambda *args, **kwargs: ({}, None))
+
+    def fake_stop(conversation_id, message_id, session_id, *, headers=None):
+        stops.append((conversation_id, message_id, session_id))
+        return {"status": "ok"}
+
+    monkeypatch.setattr(transport, "stop_deep_research", fake_stop)
+
+    request = ChatRequest(
+        messages=[Message.text("user", "research")],
+        model="auto",
+        metadata={
+            "on_deep_research_session": lambda conversation_id, message_id, session_id: sessions.append(
+                (conversation_id, message_id, session_id)
+            ),
+            "cancel_requested": lambda: True,
+        },
+    )
+
+    with pytest.raises(ProviderError, match="cancelled"):
+        transport._deep_research_sync(request)
+
+    assert sessions == [("conversation-1", "message-1", "widget-123")]
+    assert stops == [("conversation-1", "message-1", "widget-123")]
 
 
 def test_deep_research_report_text_from_widget_update():

@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 
 import chatgpt_api.cli as cli
@@ -88,13 +89,71 @@ def test_doctor_json_reports_missing_setup_without_crashing(tmp_path, capsys):
 
 
 def test_server_command_prints_start_command(capsys):
-    exit_code = main(["server", "command", "--preset", "local", "--accounts", "free,pro", "--api-key", "local-dev-key"])
+    exit_code = main(["server", "command", "--preset", "local", "--api-key", "local-dev-key"])
 
     output = capsys.readouterr().out
     assert exit_code == 0
     assert "python3 -m chatgpt_api server start" in output
-    assert "--accounts free,pro" in output
+    assert "--accounts" not in output
     assert "local-dev-key" in output
+
+
+def test_server_command_keeps_explicit_account_pool(capsys):
+    exit_code = main(["server", "command", "--preset", "local", "--accounts", "go,plus-main", "--api-key", "local-dev-key"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "--accounts go,plus-main" in output
+
+
+def test_server_command_accepts_launch_overrides(capsys):
+    exit_code = main(
+        [
+            "server",
+            "command",
+            "--preset",
+            "local",
+            "--api-key",
+            "local-dev-key",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8010",
+            "--public-base-url",
+            "http://127.0.0.1:8010/v1",
+            "--account-strategy",
+            "random",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "--account-strategy random" in output
+    assert "--port 8010" in output
+    assert "--public-base-url http://127.0.0.1:8010/v1" in output
+
+
+def test_server_accounts_auto_discovers_saved_captures(tmp_path):
+    for name in ("go", "plus-main"):
+        capture = tmp_path / name / "chatgpt-request.txt"
+        capture.parent.mkdir()
+        capture.write_text("URL: https://chatgpt.com/backend-api/f/conversation\n", encoding="utf-8")
+
+    args = argparse.Namespace(accounts="", account="", accounts_dir=tmp_path)
+
+    assert cli._server_accounts_from_args(args) == ("go", "plus-main")
+    assert cli._primary_account_from_args(args, ("go", "plus-main")) == "go"
+
+
+def test_server_accounts_can_be_pinned_to_skip_broken_profiles(tmp_path):
+    for name in ("broken-old", "plus"):
+        capture = tmp_path / name / "chatgpt-request.txt"
+        capture.parent.mkdir()
+        capture.write_text("URL: https://chatgpt.com/backend-api/f/conversation\n", encoding="utf-8")
+
+    args = argparse.Namespace(accounts="plus", account="", accounts_dir=tmp_path)
+
+    assert cli._server_accounts_from_args(args) == ("plus",)
 
 
 def test_server_command_docker_accounts_mount_is_writable(capsys):
@@ -104,6 +163,301 @@ def test_server_command_docker_accounts_mount_is_writable(capsys):
     assert exit_code == 0
     assert "/data/secrets/accounts:ro" not in output
     assert "-v \"$PWD/secrets/accounts:/data/secrets/accounts\"" in output
+
+
+def test_api_chat_posts_route_override_to_bridge_router(monkeypatch, capsys):
+    calls = {}
+
+    async def fake_api_request_json(args, method, path, body):
+        calls["method"] = method
+        calls["path"] = path
+        calls["body"] = body
+        return {
+            "id": "chatcmpl_test",
+            "model": body["model"],
+            "chatgpt_account": "pro",
+            "choices": [{"message": {"content": "ok from router"}}],
+        }
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    exit_code = main(
+        [
+            "api",
+            "chat",
+            "--message",
+            "hello",
+            "--model",
+            "auto",
+            "--account",
+            "pro",
+            "--temporary-chat",
+            "--agent-mode",
+            "opencode",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert calls["method"] == "POST"
+    assert calls["path"] == "/chat/completions"
+    assert calls["body"]["chatgpt_account"] == "pro"
+    assert calls["body"]["metadata"]["chatgpt_temporary_chat"] is True
+    assert calls["body"]["metadata"]["agent_mode"] == "opencode"
+    assert "ok from router" in output
+
+
+def test_api_image_saves_locally_without_sending_host_output_path(tmp_path, monkeypatch, capsys):
+    calls = {}
+
+    async def fake_api_request_json(args, method, path, body):
+        calls["method"] = method
+        calls["path"] = path
+        calls["body"] = body
+        return {
+            "id": "img_test",
+            "model": body["model"],
+            "chatgpt_account": "pro",
+            "data": [
+                {
+                    "b64_json": "cG5nLWJ5dGVz",
+                    "mime_type": "image/png",
+                    "path": "/data/outputs/generated.png",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+    output_dir = tmp_path / "local-images"
+
+    exit_code = main(
+        [
+            "api",
+            "image",
+            "--prompt",
+            "make one image",
+            "--account",
+            "pro",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert calls["method"] == "POST"
+    assert calls["path"] == "/images/generations"
+    assert "output_dir" not in calls["body"]
+    assert "output_path" not in calls["body"]
+    assert calls["body"]["chatgpt_account"] == "pro"
+    saved = output_dir / "generated.png"
+    assert saved.read_bytes() == b"png-bytes"
+    assert f"local_path[1]={saved.resolve()}" in output
+
+
+def test_api_edit_saves_locally_without_sending_host_output_path(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    calls = {}
+
+    async def fake_api_request_json(args, method, path, body):
+        calls["method"] = method
+        calls["path"] = path
+        calls["body"] = body
+        return {
+            "id": "edit_test",
+            "model": body["model"],
+            "data": [
+                {
+                    "b64_json": "ZWRpdC1ieXRlcw==",
+                    "mime_type": "image/png",
+                    "path": "/data/outputs/edited.png",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+    output_path = tmp_path / "edited-local.png"
+
+    exit_code = main(
+        [
+            "api",
+            "edit",
+            "--prompt",
+            "edit image",
+            "--input-image",
+            str(source),
+            "--output-path",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls["method"] == "POST"
+    assert calls["path"] == "/images/edits"
+    assert "output_dir" not in calls["body"]
+    assert "output_path" not in calls["body"]
+    assert calls["body"]["input_images"][0]["data_url"].startswith("data:image/png;base64,")
+    assert output_path.read_bytes() == b"edit-bytes"
+
+
+def test_api_research_generates_cancelable_operation_id(monkeypatch, capsys):
+    calls = {}
+
+    async def fake_api_request_json(args, method, path, body):
+        calls["method"] = method
+        calls["path"] = path
+        calls["body"] = body
+        return {
+            "id": "chatcmpl_research",
+            "model": body["model"],
+            "chatgpt_account": "pro",
+            "chatgpt_operation_id": body["chatgpt_operation_id"],
+            "chatgpt_research_report_path": "/tmp/report.md",
+            "chatgpt_research_report_download_url": "http://127.0.0.1:8000/v1/chatgpt/files/file/report.md",
+            "choices": [{"message": {"content": "Deep Research complete."}}],
+        }
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    exit_code = main(
+        [
+            "api",
+            "research",
+            "--prompt",
+            "research this",
+            "--operation-id",
+            "chatgptop_test",
+            "--accounts",
+            "free,pro",
+            "--account-strategy",
+            "failover",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert calls["method"] == "POST"
+    assert calls["path"] == "/chat/completions"
+    assert calls["body"]["deep_research"] is True
+    assert calls["body"]["chatgpt_operation_id"] == "chatgptop_test"
+    assert calls["body"]["chatgpt_accounts"] == ["free", "pro"]
+    assert calls["body"]["chatgpt_account_strategy"] == "failover"
+    assert "api operation --operation-id chatgptop_test" in output
+    assert "api cancel --operation-id chatgptop_test" in output
+    assert "deep_research_ready=yes" in output
+
+
+def test_api_research_prints_cancelled_without_provider_error(monkeypatch, capsys):
+    async def fake_api_request_json(args, method, path, body):
+        raise cli.ProviderError("API POST /chat/completions failed: HTTP 499: ChatGPT Deep Research cancelled")
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    exit_code = main(
+        [
+            "api",
+            "research",
+            "--prompt",
+            "research this",
+            "--operation-id",
+            "chatgptop_cancelled",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 130
+    assert "Research Cancelled" in captured.out
+    assert "operation_id=chatgptop_cancelled" in captured.out
+    assert "status=cancelled" in captured.out
+    assert "provider error" not in captured.err
+
+
+def test_api_operation_gets_operation_id(monkeypatch, capsys):
+    calls = {}
+
+    async def fake_api_request_json(args, method, path, body):
+        calls["method"] = method
+        calls["path"] = path
+        calls["body"] = body
+        return {
+            "object": "chatgpt.operation",
+            "operation": {
+                "id": "chatgptop_test",
+                "kind": "research",
+                "account": "pro",
+                "provider_selected": True,
+                "conversation_id": "conversation-1",
+                "deep_research_message_id": "message-1",
+                "deep_research_session_id": "session-1",
+                "deep_research_ready": True,
+                "cancel_requested": False,
+                "completed": False,
+            },
+        }
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    exit_code = main(["api", "operation", "--operation-id", "chatgptop_test"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert calls["method"] == "GET"
+    assert calls["path"] == "/chatgpt/operations/chatgptop_test"
+    assert calls["body"] is None
+    assert "Operation Status" in output
+    assert "deep_research_ready=yes" in output
+    assert "deep_research_session_id=session-1" in output
+
+
+def test_api_cancel_posts_operation_id(monkeypatch, capsys):
+    calls = {}
+
+    async def fake_api_request_json(args, method, path, body):
+        calls["method"] = method
+        calls["path"] = path
+        calls["body"] = body
+        return {
+            "status": "ok",
+            "operation": {
+                "id": "chatgptop_test",
+                "kind": "research",
+                "cancel_requested": True,
+                "completed": False,
+            },
+        }
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    exit_code = main(["api", "cancel", "--operation-id", "chatgptop_test"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert calls["method"] == "POST"
+    assert calls["path"] == "/chatgpt/operations/chatgptop_test/cancel"
+    assert calls["body"] == {}
+    assert "cancel_requested=yes" in output
+
+
+def test_api_vision_sends_data_url_input_image(tmp_path, monkeypatch):
+    image_path = tmp_path / "sample.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    calls = {}
+
+    async def fake_api_request_json(args, method, path, body):
+        calls["method"] = method
+        calls["path"] = path
+        calls["body"] = body
+        return {"text": "seen", "mode": "describe", "choices": [{"message": {"content": "seen"}}]}
+
+    monkeypatch.setattr(cli, "_api_request_json", fake_api_request_json)
+
+    exit_code = main(["api", "vision", "--mode", "describe", "--input-image", str(image_path)])
+
+    assert exit_code == 0
+    assert calls["path"] == "/chatgpt/vision"
+    assert calls["body"]["input_images"][0]["name"] == "sample.png"
+    assert calls["body"]["input_images"][0]["data_url"].startswith("data:image/png;base64,")
 
 
 def test_account_info_from_account_profile(tmp_path, capsys):

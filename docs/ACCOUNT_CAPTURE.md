@@ -82,7 +82,7 @@ The pasted cURL must still contain all of these pieces:
 | --- | --- |
 | `https://chatgpt.com/backend-api/f/conversation` | Tells the bridge which ChatGPT endpoint to replay. |
 | `-H 'Authorization: Bearer ...'` | Carries the account access token. |
-| `-H 'Cookie: ...'` | Carries session cookies and Cloudflare/browser state. |
+| `-H 'Cookie: ...'` or `-b '...'` | Carries session cookies and Cloudflare/browser state. |
 | `--data-raw '{...}'` | Carries the ChatGPT request JSON template. |
 | Sentinel headers | ChatGPT browser proof values, when present. |
 | `x-conduit-token` | ChatGPT routing value, when present. |
@@ -102,6 +102,17 @@ curl 'https://chatgpt.com/backend-api/f/conversation' \
   -H 'x-conduit-token: REDACTED' \
   --data-raw '{"action":"next","messages":[{"author":{"role":"user"},"content":{"content_type":"text","parts":["hello"]}}],"parent_message_id":"client-created-root","model":"auto","client_prepare_state":"success"}'
 ```
+
+Chrome and Safari may serialize cookies differently. Both of these are valid
+for local capture import:
+
+```sh
+-H 'Cookie: oai-did=REDACTED; __Secure-next-auth.session-token.0=REDACTED'
+-b 'oai-did=REDACTED; __Secure-next-auth.session-token.0=REDACTED'
+```
+
+If the copied cURL has Authorization but no `Cookie:` header and no `-b` cookie
+argument, it is not enough for a ChatGPT Web capture.
 
 For your real local capture, do not replace values with `REDACTED`. Redact only
 when posting examples publicly.
@@ -182,7 +193,8 @@ missing=url,authorization,cookie
 ```
 
 the pasted text is incomplete or not in a supported shape. For cURL, paste the
-whole command, not only the first line.
+whole command, not only the first line. The command must include cookies through
+either `-H 'Cookie: ...'` or `-b '...'`.
 
 ## Save Through The Console
 
@@ -292,8 +304,8 @@ The default Compose file mounts host `./secrets/accounts` to
 
 `missing=url,authorization,cookie`:
 : The parser did not find the three minimum required pieces. For cURL, paste the
-  entire command including URL, `-H Authorization`, `-H Cookie`, and `--data-raw`.
-  For Headers/Payload, copy both tabs.
+  entire command including URL, `-H Authorization`, cookies through
+  `-H Cookie` or `-b`, and `--data-raw`. For Headers/Payload, copy both tabs.
 
 `missing=request_json`:
 : The capture is missing the JSON body. Copy the Payload tab, Safari Request
@@ -314,8 +326,11 @@ Only one account routes:
 
 Image or file upload blocked:
 : Check `/v1/chatgpt/usage`. Free accounts can have low or blocked image/upload
-  quota. Image edit, OCR, describe, and composite routes all consume upload
-  capacity before image generation.
+  quota. OCR, describe, chat-with-image, image edit, and composite routes all
+  consume upload capacity before the model sees the source image. Image edit and
+  composite routes also need image generation quota for the final output. If a
+  feature says `not_reported`, the bridge treats it as unknown rather than
+  blocked, so the request can still try that account.
 
 Deep Research blocked:
 : Use a normal, non-temporary chat mode and a plan that exposes Deep Research.

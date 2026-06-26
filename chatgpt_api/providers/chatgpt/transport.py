@@ -682,6 +682,14 @@ class ChatGPTWebTransport:
             return _deep_research_result_with_wall_time(DeepResearchResult(text=text, metadata={}), started_monotonic)
         conversation_id = _conversation_id_from_events(events)
         message_id = _latest_message_id_from_value(events)
+        on_session = request.metadata.get("on_deep_research_session")
+        if callable(on_session):
+            on_session(conversation_id, message_id, widget.widget_session_id)
+        cancel_requested = request.metadata.get("cancel_requested")
+        if callable(cancel_requested) and cancel_requested():
+            if conversation_id and message_id:
+                self.stop_deep_research(conversation_id, message_id, widget.widget_session_id)
+            raise ProviderError("ChatGPT Deep Research cancelled")
         skip_sleep_metadata = self._maybe_skip_deep_research_sleep(
             conversation_id,
             message_id,
@@ -701,7 +709,13 @@ class ChatGPTWebTransport:
                 _deep_research_result_with_metadata(confirm_result, {**skip_sleep_metadata, **confirm_metadata}),
                 started_monotonic,
             )
-        result = self._read_deep_research_widget_report(widget, headers, conversation_id, message_id)
+        result = self._read_deep_research_widget_report(
+            widget,
+            headers,
+            conversation_id,
+            message_id,
+            cancel_requested=cancel_requested if callable(cancel_requested) else None,
+        )
         return _deep_research_result_with_wall_time(
             _deep_research_result_with_metadata(result, {**skip_sleep_metadata, **confirm_metadata}),
             started_monotonic,
@@ -788,6 +802,7 @@ class ChatGPTWebTransport:
         headers: dict[str, str],
         conversation_id: str | None = None,
         message_id: str | None = None,
+        cancel_requested: Any | None = None,
     ) -> DeepResearchResult:
         try:
             import websocket
@@ -829,9 +844,17 @@ class ChatGPTWebTransport:
             last_metadata: dict[str, Any] = {}
             last_mcp_poll = 0.0
             while time.monotonic() < deadline:
+                if callable(cancel_requested) and cancel_requested():
+                    if conversation_id and message_id:
+                        self.stop_deep_research(conversation_id, message_id, widget.widget_session_id)
+                    raise ProviderError("ChatGPT Deep Research cancelled")
                 try:
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
+                    if callable(cancel_requested) and cancel_requested():
+                        if conversation_id and message_id:
+                            self.stop_deep_research(conversation_id, message_id, widget.widget_session_id)
+                        raise ProviderError("ChatGPT Deep Research cancelled")
                     mcp_result = self._deep_research_get_state_result(
                         conversation_id,
                         message_id,

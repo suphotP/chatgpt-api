@@ -112,6 +112,11 @@ class BridgeAdminStore:
             self.delete_artifacts(stale_ids)
         return [artifact for artifact in artifacts if artifact["exists"]][:safe_limit]
 
+    def get_artifact(self, file_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM artifacts WHERE file_id = ?", (file_id,)).fetchone()
+        return self._artifact_row(row) if row is not None else None
+
     def artifact_count(self) -> int:
         with self._connect() as db:
             rows = db.execute("SELECT file_id, path FROM artifacts").fetchall()

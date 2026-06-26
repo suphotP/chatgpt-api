@@ -13,10 +13,15 @@ Images do not bundle your ChatGPT account captures. Mount them from the host.
 Expected host layout:
 
 ```text
-secrets/accounts/free-main/chatgpt-request.txt
+secrets/accounts/free/chatgpt-request.txt
+secrets/accounts/go/chatgpt-request.txt
+secrets/accounts/plus-main/chatgpt-request.txt
 secrets/accounts/pro-main/chatgpt-request.txt
 outputs/
 ```
+
+Use any subset and any ASCII alias you want. `free`, `go`, `plus-main`, and
+`pro-main` are examples, not required names.
 
 Do not commit `secrets/`. The captures contain live browser credentials.
 
@@ -91,9 +96,10 @@ deployments where account captures are managed outside the container.
   with `bun --cwd apps/bridge-console dev`.
 
 `CHATGPT_ACCOUNTS`
-: Comma-separated account names to route, for example `free-main,pro-main`.
-  These names are local aliases from `secrets/accounts/<name>/`, not automatic
-  plan selectors.
+: Optional comma-separated account names to route, for example
+  `free,go,plus-main,pro-main`. Leave it blank to auto-discover every saved
+  capture under `secrets/accounts/*`. These names are local aliases from
+  `secrets/accounts/<name>/`, not automatic plan selectors.
 
 `CHATGPT_ACCOUNTS_DIR`
 : Mounted account capture directory. In Docker this is `/data/secrets/accounts`.
@@ -115,8 +121,9 @@ deployments where account captures are managed outside the container.
 : Local chat throttles. Recommended defaults are `free=1,go=2,plus=3,pro=4`.
 
 `CHATGPT_UPLOAD_CONCURRENCY`
-: Local source-image upload throttles for OCR, describe, image edit, and
-  composite requests. Recommended defaults are `free=1,go=1,plus=1,pro=1`.
+: Local source-image upload throttles for OCR, describe, chat-with-image, image
+  edit, and composite requests. These routes also use ChatGPT `file_upload`
+  quota when reported. Recommended defaults are `free=1,go=1,plus=1,pro=1`.
 
 `CHATGPT_IMAGE_CONCURRENCY`
 : Local image throttles. Recommended defaults are `free=1,go=1,plus=2,pro=3`.
@@ -124,6 +131,12 @@ deployments where account captures are managed outside the container.
 `CHATGPT_RESEARCH_CONCURRENCY`
 : Local Deep Research throttles. Recommended defaults are
   `free=1,go=1,plus=2,pro=2`.
+
+The Docker image does not migrate account files. Existing captures under the
+mounted `./secrets/accounts` directory keep working after rebuilds. Existing
+outputs and artifact metadata keep working when `./outputs` stays mounted.
+Newer routing only changes account ordering by reported usage; it does not
+change the capture file format.
 
 ## CLI Checks
 
@@ -133,12 +146,16 @@ From the host:
 python3 -m chatgpt_api doctor --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key
 python3 -m chatgpt_api admin capacity --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key
 python3 -m chatgpt_api admin models --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key
+python3 -m chatgpt_api api health --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key
+python3 -m chatgpt_api api chat --message "Reply with exactly: docker bridge ok" --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key
+python3 -m chatgpt_api api chat --message "Reply with exactly: pinned route ok" --accounts free,go,plus-main,pro-main --account-strategy random --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key
 ```
 
 From inside the container:
 
 ```sh
 docker compose exec chatgpt-api python3 -m chatgpt_api doctor --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key
+docker compose exec chatgpt-api python3 -m chatgpt_api api health --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key
 ```
 
 ## Account Management
@@ -172,7 +189,7 @@ Generated images and Deep Research reports are stored under `/data/outputs`.
 Clients should use `download_url` values returned by the API:
 
 ```text
-GET /v1/chatgpt/files/{file_id}/{filename}
+GET/HEAD /v1/chatgpt/files/{file_id}/{filename}
 ```
 
 Use local `path` values only for scripts running on the same machine or inside

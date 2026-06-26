@@ -79,19 +79,25 @@ Primary commands:
 python3 -m chatgpt_api doctor
 python3 -m chatgpt_api menu
 python3 -m chatgpt_api server command --preset local
-python3 -m chatgpt_api server start --accounts free-main,pro-main --api-key local-dev-key
+python3 -m chatgpt_api server command --preset local --port 8010 --account-strategy random
+python3 -m chatgpt_api server start --api-key local-dev-key
 python3 -m chatgpt_api admin status --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key
 python3 -m chatgpt_api admin account add --account pro-main --capture-file ./chatgpt-request.txt
 chatgpt-api admin account update --account pro-main --capture-file ./chatgpt-request.txt
 chatgpt-api admin account verify --account all
 chatgpt-api admin account delete --account old-free-main
-chatgpt-api chat --account pro-main --message "hello"
-chatgpt-api image --account pro-main --prompt "small icon" --out icon.png
-chatgpt-api vision --mode ocr --input-image ./panel.png --prompt "Extract text"
+python3 -m chatgpt_api api chat --message "hello" --accounts free,go,plus-main,pro-main --account-strategy random --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key
+python3 -m chatgpt_api api image --prompt "small icon" --output-dir ./outputs/manual-images --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key
+python3 -m chatgpt_api api vision --mode ocr --input-image ./panel.png --prompt "Extract text" --base-url http://127.0.0.1:8000/v1 --api-key local-dev-key
 ```
 
 `--account` values are local account names chosen by the operator when saving a
-capture. Use names like `free-main`, `pro-main`, `work-pro`, or `free-2`.
+capture. Use names like `free`, `go`, `plus-main`, `pro-main`, `work-pro`, or
+`free-2`. If `--accounts`/`CHATGPT_ACCOUNTS` is omitted, saved captures under
+`secrets/accounts/*` are auto-discovered.
+Use `api ...` commands to exercise the real server router, strategy,
+cancellation, and artifact store. Use direct `chat`, `image`, and `vision`
+commands only as local account-capture diagnostics.
 They are not automatic plan selectors.
 
 `chatgpt_api/cli.py` is still large. It should be split later into:
@@ -120,7 +126,8 @@ POST /v1/images/generations
 POST /v1/images/edits
 POST /v1/chatgpt/vision
 GET  /v1/chatgpt/usage
-GET  /v1/chatgpt/files/{file_id}/{filename}
+GET/HEAD /v1/chatgpt/files/{file_id}/{filename}
+GET  /v1/chatgpt/operations/{operation_id}
 POST /v1/chatgpt/operations/{operation_id}/cancel
 ```
 
@@ -335,7 +342,8 @@ Safari-specific:
 Chrome-specific:
 
 - preferred: right-click the request and use `Copy as cURL`
-- the pasted cURL must include URL, Authorization, Cookie, and `--data-raw`
+- the pasted cURL must include URL, Authorization, cookies through `Cookie` or
+  `-b`, and `--data-raw`
 - alternative: copy the Headers tab and Payload tab together
 
 Captures often last around 10 days, but this is not guaranteed. Refresh
@@ -375,6 +383,18 @@ This is only the local limiter. ChatGPT Web may still impose hidden short-term
 rate limits. For example, a Pro account can show a high daily image quota but
 still hit a temporary 5-10 minute cooldown if too many generations are fired too
 quickly.
+
+Before sending real provider work, the API routes now preflight reported usage
+for request-specific features:
+
+- OCR, describe, and chat-with-image: `file_upload`
+- image edit/composite: `file_upload` plus `image_gen`
+- image generation: `image_gen`
+- Deep Research: `deep_research`
+
+The preflight changes account order; it does not reject accounts just because a
+counter is absent. A `not_reported` feature is treated as unknown capacity, not
+as exhausted, because some account captures do not expose every limit counter.
 
 Free and Go accounts should default to `auto` model selection. They should not
 be forced into high-effort or Pro-only model lanes.
@@ -476,7 +496,8 @@ Bounding boxes are model-estimated rather than native OCR engine coordinates.
 Use them for prototypes and overlays, or pair the route with a dedicated OCR
 engine when exact layout precision matters.
 
-Vision and image edit share the same upload concurrency limiter.
+Vision and image edit share the same upload concurrency limiter and use the
+ChatGPT `file_upload` counter when that usage is reported.
 
 ## Deep Research
 
@@ -518,8 +539,12 @@ Images and research reports are registered in the admin store and served by the
 Bridge API:
 
 ```text
-GET /v1/chatgpt/files/{file_id}/{filename}
+GET/HEAD /v1/chatgpt/files/{file_id}/{filename}
 ```
+
+The download handler first checks the live in-memory registry, then falls back
+to the admin SQLite artifact record. This keeps download URLs valid after an
+API restart when the output file and admin DB are on persistent storage.
 
 Responses usually include:
 
@@ -551,6 +576,7 @@ failed image jobs should not appear as successful library entries.
 The API supports operation cancellation:
 
 ```text
+GET  /v1/chatgpt/operations/{operation_id}
 POST /v1/chatgpt/operations/{operation_id}/cancel
 ```
 
@@ -559,8 +585,17 @@ requests. If a browser client refreshes the page, navigates away, or cancels a
 request, app servers should call the cancel endpoint so ChatGPT Web does not
 keep spending account quota in the background.
 
-Deep Research uses a connector stop call. Normal chat and image routes use the
-ChatGPT Web stop conversation path where available.
+Operation ids are not durable records. They exist for the live API process so a
+currently running request can be inspected or cancelled. After restart, old
+operation ids may return 404 even though completed artifact downloads still work
+through the persisted admin DB and mounted output files.
+
+Deep Research reads the widget session through WSS, then uses the connector MCP
+`stop` call once `conversation_id`, assistant `message_id`, and widget
+`session_id` are known. Normal chat and image routes use the ChatGPT Web stop
+conversation path where available. Clients should poll the operation status
+route and treat `deep_research_ready=true` as the point where a manual Deep
+Research cancel can send the MCP stop call immediately.
 
 ## Docker
 

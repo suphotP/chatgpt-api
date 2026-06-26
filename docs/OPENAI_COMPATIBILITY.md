@@ -10,7 +10,7 @@ moving to a stricter production provider.
 ## Local Test Endpoint
 
 ```sh
-CHATGPT_API_KEY=local-dev-key chatgpt-api serve --account free-main --port 8000
+CHATGPT_API_KEY=local-dev-key chatgpt-api serve --port 8000
 ```
 
 ```text
@@ -44,9 +44,14 @@ POST /v1/chat/completions
 POST /v1/images/generations
 POST /v1/images/edits
 POST /v1/chatgpt/vision
-GET  /v1/chatgpt/files/{file_id}/{filename}
+GET/HEAD /v1/chatgpt/files/{file_id}/{filename}
+GET  /v1/chatgpt/operations/{operation_id}
 POST /v1/chatgpt/operations/{operation_id}/cancel
 ```
+
+Artifact downloads support both `GET` and `HEAD`. The server can restore a
+download by `file_id` from the admin DB after restart, provided the saved file
+still exists.
 
 Supported response shapes:
 
@@ -106,9 +111,16 @@ recommended research: free=1, go=1, plus=2, pro=2
 ```
 
 `upload` is the local bucket used by input-image calls: OCR, image description,
-image edits, and multi-image composites. A single request can upload up to 10
-images. The bridge preflights `file_upload` quota when ChatGPT reports it, but
-ChatGPT can still apply hidden short burst limits.
+chat-with-image, image edits, and multi-image composites. A single request can
+upload up to 10 images. Those requests also consume ChatGPT Web
+`file_upload` usage when the account reports that counter.
+
+For multi-account routing, the bridge preflights reported `file_upload`,
+`image_gen`, and `deep_research` quota before sending the real request.
+Accounts with blocked or exhausted reported quota are tried after accounts that
+still look available. A `not_reported` feature is treated as unknown capacity,
+not as a hard limit, because some accounts do not expose every counter. ChatGPT
+can still apply hidden short burst limits after preflight.
 
 For example, two Pro accounts with the recommended image limit can run up to six
 image jobs locally, but ChatGPT may still apply hidden burst rate limits. A Pro
@@ -356,11 +368,21 @@ Accepted image references:
 - raw base64 image string
 - arrays through `images`, `input_images`, or multimodal chat content
 
+Image inputs are uploaded to ChatGPT before the model sees them. The bridge
+therefore uses the local `upload` limiter and preflights reported
+`file_upload` usage for this route.
+
 ## Image Edits And Composites
 
 `POST /v1/images/edits` uploads one to 10 source images, sends an edit/composite
 prompt to ChatGPT image generation, and saves exactly one completed output
 image.
+
+Edit/composite requests need two capacities: source-image upload
+(`file_upload`) and final image generation (`image_gen`). If one account has
+reported upload quota exhausted and another account has `file_upload` as
+`not_reported`, the latter can be selected first because it is not known to be
+blocked.
 
 ```sh
 curl 'http://127.0.0.1:8000/v1/images/edits' \
@@ -448,6 +470,7 @@ curl 'http://127.0.0.1:8000/v1/chat/completions' \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "chatgpt-deep-research",
+    "chatgpt_operation_id": "chatgptop_research_demo",
     "messages": [
       {
         "role": "user",
@@ -484,9 +507,15 @@ because ChatGPT Web only supports the full connector flow in normal chat mode.
 ## Cancellation
 
 Long-running chat, image, and research requests can be cancelled by operation
-id:
+id. Clients can provide `chatgpt_operation_id` in the request body or
+`metadata.chatgpt_operation_id` before starting a long job, then call the cancel
+route from another terminal, browser abort handler, tab close handler, or UI
+cancel button.
 
 ```sh
+curl 'http://127.0.0.1:8000/v1/chatgpt/operations/chatgptop_abc' \
+  -H 'Authorization: Bearer local-dev-key'
+
 curl 'http://127.0.0.1:8000/v1/chatgpt/operations/chatgptop_abc/cancel' \
   -X POST \
   -H 'Authorization: Bearer local-dev-key'
@@ -496,20 +525,49 @@ Response:
 
 ```json
 {
-  "ok": true,
+  "status": "ok",
   "operation": {
-    "operation_id": "chatgptop_abc",
-    "kind": "image",
-    "status": "cancel_requested"
-  },
-  "provider_stop": {
-    "status": "ok"
+    "id": "chatgptop_abc",
+    "kind": "research",
+    "account": "pro",
+    "provider_selected": true,
+    "conversation_id": "conversation-id",
+    "deep_research_ready": true,
+    "pending_reason": null,
+    "cancel_requested": true,
+    "completed": false,
+    "last_cancel_result": {
+      "conversation": {
+        "status": "ok"
+      }
+    },
+    "last_cancel_error": null
   }
 }
 ```
 
 If a frontend page refreshes, navigates away, or the user presses cancel, call
 this endpoint so the provider request does not keep running in the background.
+Operation records are intentionally in-memory runtime state. They are not
+restored after the API process or Docker container restarts. Persisted artifacts
+are different: generated image and research download URLs can be restored by
+`file_id` from the admin DB when the output file still exists on disk.
+
+Deep Research cancellation is not a pure WSS command in this bridge. The
+bridge reads the ChatGPT Deep Research widget state over WSS to discover the
+connector `session_id`. Once it also has the `conversation_id` and assistant
+`message_id`, it sends the Deep Research MCP `stop` call through ChatGPT's
+`call_mcp` endpoint. If cancellation is requested before those identifiers are
+known, the operation is marked `cancel_requested` and the stop call is attempted
+as soon as the session is available. Treat this as best-effort, not an instant
+hard kill.
+
+For Deep Research, prefer polling `GET /v1/chatgpt/operations/{id}` and wait
+until `operation.deep_research_ready` is `true` before expecting the MCP stop
+to happen immediately. If the operation shows
+`pending_reason=deep_research_session_not_available`, the cancel request is
+recorded, but the bridge is still waiting for the widget stream to expose the
+Deep Research session id.
 
 ## Compatibility Scope
 

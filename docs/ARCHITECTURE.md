@@ -25,16 +25,21 @@ opencode plugin, release artifact, or has its own test/build pipeline.
 
 There are three useful ways to use the project:
 
-1. Direct local chat:
+1. Routed local API:
 
    ```sh
-   chatgpt-api chat --account free-main --model auto --message "hello"
+   python3 -m chatgpt_api api chat \
+     --message "hello" \
+     --accounts free,go,plus-main,pro-main \
+     --account-strategy random \
+     --base-url http://127.0.0.1:8000/v1 \
+     --api-key local-dev-key
    ```
 
 2. OpenAI-shaped local API for any client:
 
    ```sh
-   chatgpt-api serve --account free-main --host 127.0.0.1 --port 8000
+   chatgpt-api serve --host 127.0.0.1 --port 8000
    ```
 
    This exposes `/v1/models` and `/v1/chat/completions` so OpenAI-shaped
