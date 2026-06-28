@@ -51,6 +51,20 @@ downloads, and developer tooling.
 > LAN tools, and agent workflows. It is not a public hosted proxy and should not
 > be deployed with shared real account captures.
 
+> [!NOTE]
+> Maintainer support for issues, pull requests, and necessary fixes is planned
+> through **June 30, 2026 (30/6/69 B.E.)**. After that, this repository will
+> remain public under the MIT license, but ongoing feature work and guaranteed
+> support are not planned because I have started a new personal main project
+> that uses related ideas, and I need to keep that boundary clear. See
+> [SUPPORT.md](SUPPORT.md) for details.
+>
+> ภาษาไทย: ผมจะช่วยตอบ issue, ดู PR, และแก้ปัญหาที่จำเป็นให้ถึง
+> **30 มิถุนายน 2026 (30/6/69)** หลังจากนั้นยัง fork/แก้/เอาไปใช้ต่อได้ตาม
+> MIT license แต่จะไม่รับประกันการดูแลต่อเนื่อง เพราะผมเพิ่งเริ่มทำโปรเจกต์ใหม่
+> ส่วนตัวที่เป็นงานหลักของผมเองและใช้แนวคิดบางส่วนร่วมกัน ไม่ได้อยู่ภายใต้
+> บริษัทไหน จึงต้องกันขอบเขตงานและผลประโยชน์ของผมเองให้ชัดเจน
+
 <table>
   <tr>
     <td><strong>Local API</strong><br><code>/v1/chat/completions</code>, images, edits, vision, research, files, admin routes.</td>
