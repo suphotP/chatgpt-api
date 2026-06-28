@@ -308,11 +308,7 @@ class ChatGPTWebTransport:
                     headers,
                 )
             )
-        input_assets = {
-            f"file-service://{file_data['file_id']}"
-            for file_data in uploaded_files
-            if isinstance(file_data.get("file_id"), str)
-        }
+        input_assets = _uploaded_image_asset_pointers(uploaded_files)
         payload = self._build_image_chat_payload(request, uploaded_files)
         if self.refresh_web_tokens:
             headers = self._refresh_web_tokens(headers, payload)
@@ -1839,6 +1835,16 @@ def _image_dimensions(data: bytes) -> tuple[int | None, int | None]:
 
 def _image_asset_pointers_from_events(events: list[dict[str, Any]], exclude: set[str] | None = None) -> list[str]:
     return _image_asset_pointers_from_value(events, exclude=exclude)
+
+
+def _uploaded_image_asset_pointers(uploaded_files: list[dict[str, Any]]) -> set[str]:
+    asset_pointers: set[str] = set()
+    for file_data in uploaded_files:
+        file_id = file_data.get("file_id")
+        if isinstance(file_id, str):
+            asset_pointers.add(f"file-service://{file_id}")
+            asset_pointers.add(f"sediment://{file_id}")
+    return asset_pointers
 
 
 def _image_asset_pointers_from_value(value: Any, exclude: set[str] | None = None) -> list[str]:

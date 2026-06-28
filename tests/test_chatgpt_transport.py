@@ -347,6 +347,55 @@ def test_generate_image_accepts_multiple_input_images(monkeypatch):
     assert response.images[0].data == b"out"
 
 
+def test_generate_image_skips_sediment_echo_of_uploaded_input(monkeypatch):
+    transport = ChatGPTWebTransport(ChatGPTAuthConfig(access_token="fake"), refresh_web_tokens=False)
+    poll_input_assets = []
+    downloaded_assets = []
+
+    monkeypatch.setattr(
+        transport,
+        "_upload_file",
+        lambda data, mime_type, image_name, headers: {
+            "file_id": "file_input",
+            "file_name": image_name,
+            "file_size": len(data),
+            "mime_type": mime_type,
+            "width": 8,
+            "height": 8,
+        },
+    )
+    monkeypatch.setattr(
+        transport,
+        "_post_conversation",
+        lambda url, headers, payload: [
+            {
+                "conversation_id": "c1",
+                "v": [{"p": "/message/content/parts/0/asset_pointer", "v": "sediment://file_input"}],
+            }
+        ],
+    )
+
+    def fake_poll(conversation_id, headers, input_assets, timeout, poll_interval, cancel_requested):
+        poll_input_assets.append(set(input_assets))
+        return ["sediment://generated"]
+
+    def fake_download(asset, headers, conversation_id):
+        downloaded_assets.append(asset)
+        return type("Image", (), {"data": b"generated", "url": None, "mime_type": "image/png", "raw": None})()
+
+    monkeypatch.setattr(transport, "_poll_generated_image_assets", fake_poll)
+    monkeypatch.setattr(transport, "_download_generated_image", fake_download)
+
+    response = transport._generate_image_sync(
+        ImageRequest(prompt="edit", image=b"input", image_mime_type="image/png", model="auto")
+    )
+
+    assert poll_input_assets == [{"file-service://file_input", "sediment://file_input"}]
+    assert downloaded_assets == ["sediment://generated"]
+    assert response.images[0].data == b"generated"
+    assert response.raw["assets"] == ["sediment://generated"]
+
+
 def test_conversation_headers_drop_transport_headers():
     headers = {"authorization": "Bearer fake", "content-length": "5", "accept-encoding": "br"}
 

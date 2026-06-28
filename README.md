@@ -116,12 +116,25 @@ downloads, and developer tooling.
 
 ## Latest Validation Snapshot
 
-These checks were run locally on 2026-06-26 after the CLI, capture, docs, and
-console updates in this branch.
+These checks were run locally on 2026-06-28 for the `/v1/images/edits`
+regression fixed in issue #3.
 
 | Check | Result |
 | --- | --- |
-| Python full test suite: `python3 -m pytest -q` | `189 passed` |
+| Targeted transport suite: `python3 -m pytest tests/test_chatgpt_transport.py -q` | `32 passed` |
+| Python full test suite: `python3 -m pytest -q` | `190 passed` |
+| Live `/v1/images/edits` request through the local bridge | passed with a real generated output image, not the uploaded input image |
+| Artifact download check for the generated image | `200 OK` |
+| Whitespace check: `git diff --check` | passed |
+
+The live proof used a local ChatGPT account capture. It verifies that the bridge
+now skips uploaded input images that reappear as `sediment://<same_id>` while it
+waits for the actual generated image asset.
+
+Earlier frontend/demo checks from 2026-06-26:
+
+| Check | Result |
+| --- | --- |
 | Bridge Console Svelte diagnostics: `bun run check` | `0 errors, 0 warnings` |
 | Bridge Console production build: `bun run build` | passed |
 | Character Game Svelte diagnostics: `bun run check` | `0 errors, 0 warnings` |
@@ -129,7 +142,6 @@ console updates in this branch.
 | Character Game production build: `bun run build` | passed |
 | Svelte MCP autofixer on `App.svelte` | no issues |
 | Docs/console stale-alias sweep | no `free-main`, `pro-main`, `plus-main`, or fake `pro/free` route examples found |
-| Whitespace check: `git diff --check` | passed |
 
 Docker and live ChatGPT account/image/OCR/research proofs require a real local
 account capture and should be rerun on the target machine before publishing a
@@ -147,6 +159,8 @@ This revision is the recommended baseline because it:
 - documents Chrome/Safari `Copy as cURL` capture import, including `Cookie:` or
   `-b` cookie input;
 - clarifies that account names are local aliases, not plan selectors;
+- fixes `/v1/images/edits` async polling so an uploaded input image echoed back
+  as `sediment://<same_id>` is not returned as the generated output;
 - keeps Docker startup separate from real ChatGPT account verification;
 - updates CLI and console docs around routing, artifacts, upload/image usage,
   and Deep Research cancellation.
